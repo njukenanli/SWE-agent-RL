@@ -1,6 +1,8 @@
 # RL with SWE-agent
 This repo provides minimal framework to sample SWE-agent trajectories and RL on the trajs.
 
+View [docs/demo.pdf](./docs/demo.pdf) for detailed algorithm explanation.
+
 ## On CPU side
 ```bash
 cd cpu
