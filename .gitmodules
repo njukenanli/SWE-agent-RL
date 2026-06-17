@@ -1,0 +1,8 @@
+[submodule "gpu/verl"]
+	path = gpu/verl
+	url = https://github.com/njukenanli/verl
+	branch = SWE-agent
+[submodule "cpu/sweagent"]
+	path = cpu/sweagent
+	url = https://github.com/njukenanli/SWE-agent-for-eval
+	branch = RL
