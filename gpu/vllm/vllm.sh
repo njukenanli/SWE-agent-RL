@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DEFAULT_MODEL="Qwen/Qwen3.5-4B"
-
-MODEL="$DEFAULT_MODEL"
+MODEL="Qwen/Qwen3.5-4B"
 HOST="0.0.0.0"
 PORT="8000"
-SERVED_MODEL_NAME=""
-API_KEY=""
+SERVED_MODEL_NAME="my-qwen-model"
+API_KEY="dummy"
 MAX_LOGPROBS="1"
 LOGPROBS_MODE="processed_logprobs"
 DRY_RUN=0
@@ -38,8 +36,11 @@ OpenAI-compatible endpoint:
   top_logprobs: 1
   prompt_logprobs: 1
 
-The server defaults below keep sampling neutral except for temperature=1.0:
-  temperature=1.0, top_p=1.0, top_k=0, min_p=0.0, repetition_penalty=1.0
+Temperature is active. All other sampling filters and penalties are explicitly
+set to their neutral values.
+
+Qwen3.5 reasoning and automatic tool calling are enabled with the qwen3 and
+qwen3_coder parsers.
 USAGE
 }
 
@@ -55,14 +56,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --port)
       PORT="${2:?missing value for --port}"
-      shift 2
-      ;;
-    --served-model-name)
-      SERVED_MODEL_NAME="${2:?missing value for --served-model-name}"
-      shift 2
-      ;;
-    --api-key)
-      API_KEY="${2:?missing value for --api-key}"
       shift 2
       ;;
     --max-logprobs)
@@ -98,7 +91,7 @@ if [[ -z "$SERVED_MODEL_NAME" ]]; then
   SERVED_MODEL_NAME="$MODEL"
 fi
 
-GENERATION_CONFIG='{"temperature":1.0,"top_p":1.0,"top_k":0,"min_p":0.0,"repetition_penalty":1.0}'
+GENERATION_CONFIG='{"temperature":1.0,"top_p":1.0,"top_k":0,"min_p":0.0,"presence_penalty":0.0,"frequency_penalty":0.0,"repetition_penalty":1.0}'
 
 if [[ -n "${VLLM_BIN:-}" ]]; then
   # Allows: VLLM_BIN="python -m vllm.entrypoints.openai.api_server" bash vllm.sh
@@ -119,6 +112,9 @@ CMD=(
   --override-generation-config "$GENERATION_CONFIG"
   --max-logprobs "$MAX_LOGPROBS"
   --logprobs-mode "$LOGPROBS_MODE"
+  --reasoning-parser qwen3
+  --enable-auto-tool-choice
+  --tool-call-parser qwen3_coder
 )
 
 if [[ -n "$API_KEY" ]]; then

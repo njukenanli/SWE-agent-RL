@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import subprocess
@@ -20,6 +21,122 @@ ENV_PATH = SCRIPT_DIR.parent / ".env"
 DEFAULT_LISTEN_HOST = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 8003
 ACK_PAYLOAD = "ACK"
+TOKEN_DETAILS_MIDDLEWARE = "server.TokenDetailsDefaultsMiddleware"
+TOKEN_DETAILS_ENDPOINTS = {
+    "/v1/completions",
+    "/v1/chat/completions",
+    "/v1/chat/completions/batch",
+}
+
+
+class TokenDetailsDefaultsMiddleware:
+    """Inject token IDs and output logprobs into vLLM generation requests."""
+
+    def __init__(self, app: object) -> None:
+        self.app = app
+
+    async def __call__(
+        self,
+        scope: dict[str, object],
+        receive: object,
+        send: object,
+    ) -> None:
+        path = str(scope.get("path", "")).rstrip("/")
+        headers = scope.get("headers", [])
+        content_type = ""
+        content_encoding = ""
+        if isinstance(headers, list):
+            for key, value in headers:
+                if key.lower() == b"content-type":
+                    content_type = value.decode("latin-1")
+                elif key.lower() == b"content-encoding":
+                    content_encoding = value.decode("latin-1")
+
+        if (
+            scope.get("type") != "http"
+            or scope.get("method") != "POST"
+            or path not in TOKEN_DETAILS_ENDPOINTS
+            or "application/json" not in content_type.lower()
+            or content_encoding
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        body_parts: list[bytes] = []
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                await self.app(scope, _single_message_receiver(message), send)
+                return
+            body_parts.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+
+        original_body = b"".join(body_parts)
+        try:
+            payload = json.loads(original_body)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            await self.app(
+                scope,
+                _single_message_receiver(
+                    {"type": "http.request", "body": original_body}
+                ),
+                send,
+            )
+            return
+
+        if not isinstance(payload, dict):
+            await self.app(
+                scope,
+                _single_message_receiver(
+                    {"type": "http.request", "body": original_body}
+                ),
+                send,
+            )
+            return
+
+        payload.setdefault("return_token_ids", True)
+        if path == "/v1/completions":
+            payload.setdefault("logprobs", 1)
+        else:
+            payload.setdefault("logprobs", True)
+            if payload.get("logprobs"):
+                payload.setdefault("top_logprobs", 1)
+
+        modified_body = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        modified_scope = dict(scope)
+        modified_headers = [
+            (key, value)
+            for key, value in headers
+            if key.lower() != b"content-length"
+        ]
+        modified_headers.append((b"content-length", str(len(modified_body)).encode()))
+        modified_scope["headers"] = modified_headers
+
+        await self.app(
+            modified_scope,
+            _single_message_receiver(
+                {"type": "http.request", "body": modified_body}
+            ),
+            send,
+        )
+
+
+def _single_message_receiver(message: dict[str, object]) -> object:
+    sent = False
+
+    async def receive() -> dict[str, object]:
+        nonlocal sent
+        if sent:
+            return {"type": "http.disconnect"}
+        sent = True
+        return message
+
+    return receive
 
 
 def parse_dotenv(path: Path) -> dict[str, str]:
@@ -164,6 +281,7 @@ def make_backend_args(
     if vllm_port is not None:
         backend_args.extend(["--port", str(vllm_port)])
 
+    backend_args.extend(["--", "--middleware", TOKEN_DETAILS_MIDDLEWARE])
     backend_args.extend(passthrough_args)
     return backend_args
 
@@ -195,6 +313,42 @@ def send_ack(cpu_machine_url: str, timeout: float, retries: int) -> bool:
                 time.sleep(1.0)
 
     return False
+
+
+def wait_for_vllm_health(
+    process: subprocess.Popen[bytes],
+    vllm_port: int,
+    request_timeout: float = 2.0,
+    poll_interval: float = 1.0,
+) -> None:
+    health_url = f"http://127.0.0.1:{vllm_port}/health"
+    last_error: Exception | None = None
+    print(f"Waiting for vLLM health check: {health_url}", flush=True)
+
+    while process.poll() is None:
+        request = Request(health_url, method="GET")
+        try:
+            with urlopen(request, timeout=request_timeout) as response:
+                response.read(256)
+                if 200 <= response.status < 300:
+                    print(
+                        f"vLLM health check passed, status={response.status}",
+                        flush=True,
+                    )
+                    return
+                last_error = RuntimeError(
+                    f"health endpoint returned status {response.status}"
+                )
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+
+        time.sleep(poll_interval)
+
+    detail = f": {last_error}" if last_error is not None else ""
+    raise RuntimeError(
+        f"vLLM backend exited with code {process.returncode} before becoming healthy"
+        f"{detail}"
+    )
 
 
 def is_ack_request(path: str, body: bytes) -> bool:
@@ -366,8 +520,18 @@ def format_command(command: list[str]) -> str:
 
 def start_backend(script: Path, backend_args: list[str]) -> subprocess.Popen[bytes]:
     command = ["bash", str(script), *backend_args]
+    env = os.environ.copy()
+    python_path = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = (
+        f"{SCRIPT_DIR}{os.pathsep}{python_path}" if python_path else str(SCRIPT_DIR)
+    )
     print(f"Starting backend: {format_command(command)}", flush=True)
-    return subprocess.Popen(command, cwd=SCRIPT_DIR, start_new_session=True)
+    return subprocess.Popen(
+        command,
+        cwd=SCRIPT_DIR,
+        env=env,
+        start_new_session=True,
+    )
 
 
 def monitor_backend(state: RuntimeState) -> None:
@@ -412,15 +576,17 @@ def main(argv: list[str]) -> int:
         )
         monitor_thread.start()
 
+        wait_for_vllm_health(process, vllm_port)
+
+        handler = make_ack_handler(state)
+        httpd = ThreadingHTTPServer((args.listen_host, args.listen_port), handler)
+        state.httpd = httpd
+
         if not send_ack(cpu_machine_url, args.ack_timeout, args.ack_retries):
             print(
                 "Failed to send ACK to CPU machine; continuing to listen",
                 file=sys.stderr,
             )
-
-        handler = make_ack_handler(state)
-        httpd = ThreadingHTTPServer((args.listen_host, args.listen_port), handler)
-        state.httpd = httpd
 
         print(
             f"Listening for ACK on {args.listen_host}:{args.listen_port}",
