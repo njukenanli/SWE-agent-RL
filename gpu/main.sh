@@ -105,7 +105,7 @@ for ((epoch = 0; epoch < EPOCH; epoch++)); do
   fi
 
   echo "[epoch $epoch/$((EPOCH - 1))] Starting vLLM server with model: $MODEL_PATH"
-  python vllm/server.py --model "$MODEL_PATH"
+  python vllm/server.py --model "$MODEL_PATH" --epoch "$epoch"
 
   echo "[epoch $epoch/$((EPOCH - 1))] Starting DAPO: $MODEL_PATH -> $MODEL_SAVE_PATH"
   (

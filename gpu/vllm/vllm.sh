@@ -24,8 +24,8 @@ Options:
   --served-model-name NAME    API model name. Default: same as --model
   --api-key KEY               Optional OpenAI-compatible API key.
   --max-logprobs N            Max logprobs the server will return. Default: 1
-  --logprobs-mode MODE        processed_logprobs, raw_logprobs, processed_logits,
-                              or raw_logits. Default: processed_logprobs
+  --logprobs-mode MODE        Must be processed_logprobs so returned values can
+                              be converted to token probabilities. This is the default.
   --dry-run                   Print the vLLM command without running it.
   -h, --help                  Show this help.
 
@@ -85,6 +85,23 @@ while [[ $# -gt 0 ]]; do
       exit 2
       ;;
   esac
+done
+
+if [[ "$LOGPROBS_MODE" != "processed_logprobs" ]]; then
+  echo "--logprobs-mode must be processed_logprobs for token probabilities" >&2
+  exit 2
+fi
+
+if [[ ! "$MAX_LOGPROBS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--max-logprobs must be a positive integer" >&2
+  exit 2
+fi
+
+for arg in "${EXTRA_ARGS[@]}"; do
+  if [[ "$arg" == "--logprobs-mode" || "$arg" == --logprobs-mode=* ]]; then
+    echo "Pass --logprobs-mode before --; it must be processed_logprobs" >&2
+    exit 2
+  fi
 done
 
 if [[ -z "$SERVED_MODEL_NAME" ]]; then

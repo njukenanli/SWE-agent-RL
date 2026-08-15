@@ -1,19 +1,22 @@
 # RL with SWE-agent
-This repo provides minimal framework to sample SWE-agent trajectories and RL on the trajs.
+This repo provides a minimal framework to sample SWE-agent trajectories and do RL on the trajs.
 
 View [docs/demo.pdf](./docs/demo.pdf) for detailed algorithm explanation.
 
 ## On CPU side
 ```bash
 cd cpu
-cd sweagent && python -m pip install --upgrade pip && pip install --editable .
+python -m venv venv
+source venv/bin/activate
+cd sweagent
+python -m pip install --upgrade pip && pip install --editable .
 ```
 
 ```bash
 python main.py --parallel_instances 1 --dataset dataset.jsonl
 ```
 
-The code waits until GPU side is ready (receives ACK from GPU side) and start rollout.
+The sweagent side waits until GPU side is ready (receives ACK from GPU side) and start rollout.
 
 ## On GPU side
 

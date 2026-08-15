@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
+import math
 import os
 import signal
 import subprocess
@@ -20,6 +23,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR.parent / ".env"
 DEFAULT_LISTEN_HOST = "0.0.0.0"
 DEFAULT_LISTEN_PORT = 8003
+DEFAULT_TRAJECTORY_UPLOAD_HOST = "127.0.0.1"
+DAPO_JSON_PATH = SCRIPT_DIR.parent / "verl" / "dapo.json"
+UPLOAD_CHUNK_SIZE = 1024 * 1024
 ACK_PAYLOAD = "ACK"
 TOKEN_DETAILS_MIDDLEWARE = "server.TokenDetailsDefaultsMiddleware"
 TOKEN_DETAILS_ENDPOINTS = {
@@ -95,13 +101,14 @@ class TokenDetailsDefaultsMiddleware:
             )
             return
 
-        payload.setdefault("return_token_ids", True)
+        # This service's consumers require aligned token IDs and probabilities,
+        # so do not allow request defaults to disable the response metadata.
+        payload["return_token_ids"] = True
         if path == "/v1/completions":
-            payload.setdefault("logprobs", 1)
+            payload["logprobs"] = 1
         else:
-            payload.setdefault("logprobs", True)
-            if payload.get("logprobs"):
-                payload.setdefault("top_logprobs", 1)
+            payload["logprobs"] = True
+            payload["top_logprobs"] = 1
 
         modified_body = json.dumps(
             payload,
@@ -214,6 +221,12 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         help="vLLM backend port. If omitted, VLLM_PORT is required in ../.env.",
     )
     parser.add_argument(
+        "--epoch",
+        type=int,
+        required=True,
+        help="Zero-based rollout epoch expected in the uploaded DAPO data.",
+    )
+    parser.add_argument(
         "--listen-host",
         default=DEFAULT_LISTEN_HOST,
         help=f"ACK listener host. Default: {DEFAULT_LISTEN_HOST}",
@@ -225,6 +238,26 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         help=f"ACK listener port. Default: {DEFAULT_LISTEN_PORT}",
     )
     parser.add_argument(
+        "--trajectory-upload-host",
+        default=DEFAULT_TRAJECTORY_UPLOAD_HOST,
+        help=(
+            "Host for the trajectory upload listener. Default: "
+            f"{DEFAULT_TRAJECTORY_UPLOAD_HOST} (SSH tunnel only)."
+        ),
+    )
+    parser.add_argument(
+        "--trajectory-upload-port",
+        type=int,
+        default=None,
+        help="Upload listener port. If omitted, TRAJECTORY_UPLOAD_PORT is required in ../.env.",
+    )
+    parser.add_argument(
+        "--dapo-json",
+        type=Path,
+        default=DAPO_JSON_PATH,
+        help=f"DAPO JSON destination. Default: {DAPO_JSON_PATH}",
+    )
+    parser.add_argument(
         "--ack-timeout",
         type=float,
         default=5.0,
@@ -233,8 +266,14 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument(
         "--ack-retries",
         type=int,
-        default=3,
-        help="Outbound ACK attempts before continuing. Default: 3",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--ack-retry-interval",
+        type=float,
+        default=60.0,
+        help="Seconds between CPU readiness ACK attempts. Default: 60.",
     )
     parser.add_argument(
         "--stop-timeout",
@@ -244,6 +283,10 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     )
 
     args, backend_args = parser.parse_known_args(argv)
+    if args.epoch < 0:
+        parser.error("--epoch must be non-negative")
+    if args.ack_retry_interval < 0:
+        parser.error("--ack-retry-interval must be non-negative")
     if backend_args and backend_args[0] == "--":
         backend_args = backend_args[1:]
     return args, backend_args
@@ -271,6 +314,20 @@ def resolve_vllm_port(
         raise ValueError(f"invalid VLLM_PORT in {ENV_PATH}: {env_port!r}") from exc
 
 
+def resolve_trajectory_upload_port(explicit_port: int | None, env_values: dict[str, str]) -> int:
+    if explicit_port is not None:
+        return validate_port(explicit_port, "--trajectory-upload-port")
+
+    env_port = env_values.get("TRAJECTORY_UPLOAD_PORT")
+    if not env_port:
+        raise RuntimeError(f"TRAJECTORY_UPLOAD_PORT is not set in {ENV_PATH}")
+
+    try:
+        return validate_port(int(env_port), "TRAJECTORY_UPLOAD_PORT")
+    except ValueError as exc:
+        raise ValueError(f"invalid TRAJECTORY_UPLOAD_PORT in {ENV_PATH}: {env_port!r}") from exc
+
+
 def make_backend_args(
     passthrough_args: list[str], model: str | None, vllm_port: int | None
 ) -> list[str]:
@@ -286,31 +343,56 @@ def make_backend_args(
     return backend_args
 
 
-def send_ack(cpu_machine_url: str, timeout: float, retries: int) -> bool:
-    retries = max(retries, 1)
-    payload = ACK_PAYLOAD.encode("utf-8")
+def send_ack_until_received(
+    cpu_machine_url: str,
+    timeout: float,
+    retry_interval: float,
+    *,
+    epoch: int,
+    shutdown_event: threading.Event,
+    process: subprocess.Popen[bytes],
+) -> bool:
+    if retry_interval < 0:
+        raise ValueError("ACK retry interval must be non-negative")
 
-    for attempt in range(1, retries + 1):
+    payload = ACK_PAYLOAD.encode("utf-8")
+    attempt = 0
+
+    while not shutdown_event.is_set() and process.poll() is None:
+        attempt += 1
         request = Request(
             cpu_machine_url,
             data=payload,
             method="POST",
-            headers={"Content-Type": "text/plain; charset=utf-8"},
+            headers={
+                "Content-Type": "text/plain; charset=utf-8",
+                "X-DAPO-Epoch": str(epoch),
+            },
         )
 
         try:
             with urlopen(request, timeout=timeout) as response:
                 response.read(256)
-                print(f"Sent ACK to CPU machine, status={response.status}", flush=True)
-                return True
+                if response.status == 200:
+                    print(
+                        f"CPU machine received readiness ACK, status=200, attempt={attempt}",
+                        flush=True,
+                    )
+                    return True
+                failure = f"unexpected HTTP status {response.status}"
         except (HTTPError, URLError, TimeoutError, OSError) as exc:
-            print(
-                f"ACK send attempt {attempt}/{retries} failed: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-            if attempt < retries:
-                time.sleep(1.0)
+            failure = str(exc)
+
+        if shutdown_event.is_set() or process.poll() is not None:
+            break
+        print(
+            f"CPU readiness ACK attempt {attempt} failed: {failure}; "
+            f"retrying in {retry_interval:g} seconds",
+            file=sys.stderr,
+            flush=True,
+        )
+        if shutdown_event.wait(retry_interval):
+            break
 
     return False
 
@@ -369,6 +451,63 @@ def is_ack_request(path: str, body: bytes) -> bool:
     )
 
 
+def validate_dapo_data(data: object) -> None:
+    if not isinstance(data, list) or not data:
+        raise ValueError("DAPO data must be a non-empty list of task groups")
+
+    for group_index, group in enumerate(data):
+        if not isinstance(group, list) or not group:
+            raise ValueError(f"group {group_index} must be a non-empty list of trajectories")
+        for trajectory_index, trajectory in enumerate(group):
+            if not isinstance(trajectory, list):
+                raise ValueError(f"group {group_index}, trajectory {trajectory_index} must be a list")
+
+            reward: float | None = None
+            for step_index, step in enumerate(trajectory):
+                label = f"group {group_index}, trajectory {trajectory_index}, step {step_index}"
+                if not isinstance(step, list) or len(step) != 3:
+                    raise ValueError(f"{label} must be [input_token_ids, output_pairs, reward]")
+                input_token_ids, output_pairs, step_reward = step
+
+                if not isinstance(input_token_ids, list) or any(
+                    isinstance(token_id, bool) or not isinstance(token_id, int) for token_id in input_token_ids
+                ):
+                    raise ValueError(f"{label} input_token_ids must be a list of integers")
+                if not isinstance(output_pairs, list):
+                    raise ValueError(f"{label} output_pairs must be a list")
+                for pair_index, pair in enumerate(output_pairs):
+                    if not isinstance(pair, list) or len(pair) != 2:
+                        raise ValueError(f"{label}, output {pair_index} must be [token_id, probability]")
+                    token_id, probability = pair
+                    if isinstance(token_id, bool) or not isinstance(token_id, int):
+                        raise ValueError(f"{label}, output {pair_index} token ID must be an integer")
+                    if isinstance(probability, bool) or not isinstance(probability, (int, float)):
+                        raise ValueError(f"{label}, output {pair_index} probability must be numeric")
+                    try:
+                        probability = float(probability)
+                    except OverflowError as exc:
+                        raise ValueError(
+                            f"{label}, output {pair_index} probability must be finite"
+                        ) from exc
+                    if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+                        raise ValueError(f"{label}, output {pair_index} probability must be in [0, 1]")
+
+                if isinstance(step_reward, bool) or not isinstance(step_reward, (int, float)):
+                    raise ValueError(f"{label} reward must be 0 or 1")
+                try:
+                    step_reward = float(step_reward)
+                except OverflowError as exc:
+                    raise ValueError(f"{label} reward must be 0 or 1") from exc
+                if not math.isfinite(step_reward) or step_reward not in {0.0, 1.0}:
+                    raise ValueError(f"{label} reward must be 0 or 1")
+                if reward is None:
+                    reward = step_reward
+                elif step_reward != reward:
+                    raise ValueError(
+                        f"group {group_index}, trajectory {trajectory_index} has inconsistent rewards"
+                    )
+
+
 def signal_process_group(
     process: subprocess.Popen[bytes], sig: signal.Signals
 ) -> None:
@@ -412,24 +551,52 @@ def stop_backend(
 
 
 class RuntimeState:
-    def __init__(self, process: subprocess.Popen[bytes], stop_timeout: float) -> None:
+    def __init__(
+        self,
+        process: subprocess.Popen[bytes],
+        stop_timeout: float,
+        *,
+        epoch: int,
+        dapo_path: Path,
+    ) -> None:
         self.process = process
         self.stop_timeout = stop_timeout
+        self.epoch = epoch
+        self.dapo_path = dapo_path
         self.httpd: ThreadingHTTPServer | None = None
+        self.upload_httpd: ThreadingHTTPServer | None = None
         self._lock = threading.Lock()
+        self._upload_lock = threading.Lock()
+        self.shutdown_event = threading.Event()
         self._stopping = False
         self._stop_thread: threading.Thread | None = None
+        self._ready_epoch: int | None = None
+        self._ready_checksum: str | None = None
 
     @property
     def stopping(self) -> bool:
         with self._lock:
             return self._stopping
 
+    @property
+    def upload_lock(self) -> threading.Lock:
+        return self._upload_lock
+
+    def mark_trajectory_ready(self, epoch: int, checksum: str) -> None:
+        with self._lock:
+            self._ready_epoch = epoch
+            self._ready_checksum = checksum
+
+    def trajectory_is_ready(self) -> bool:
+        with self._lock:
+            return self._ready_epoch == self.epoch and self._ready_checksum is not None
+
     def request_stop(self, reason: str) -> threading.Thread | None:
         with self._lock:
             if self._stopping:
                 return self._stop_thread
             self._stopping = True
+            self.shutdown_event.set()
 
         thread = threading.Thread(
             target=self._stop_backend_and_listener,
@@ -445,10 +612,15 @@ class RuntimeState:
         stop_backend(self.process, self.stop_timeout, reason)
         if self.httpd is not None:
             self.httpd.shutdown()
+        if self.upload_httpd is not None:
+            self.upload_httpd.shutdown()
 
     def shutdown_listener(self) -> None:
+        self.shutdown_event.set()
         if self.httpd is not None:
             self.httpd.shutdown()
+        if self.upload_httpd is not None:
+            self.upload_httpd.shutdown()
 
     def wait_for_stop(self) -> None:
         with self._lock:
@@ -479,7 +651,44 @@ def make_ack_handler(state: RuntimeState) -> type[BaseHTTPRequestHandler]:
             body = self.rfile.read(content_length) if content_length > 0 else b""
 
             if is_ack_request(self.path, body):
+                epoch_header = self.headers.get("X-DAPO-Epoch")
+                try:
+                    ack_epoch = state.epoch if epoch_header is None else int(epoch_header)
+                except ValueError:
+                    response = b"X-DAPO-Epoch must be an integer\n"
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(response)))
+                    self.end_headers()
+                    self.wfile.write(response)
+                    return
+                if ack_epoch < 0 or ack_epoch > state.epoch:
+                    response = f"Expected ACK epoch at most {state.epoch}, got {ack_epoch}\n".encode()
+                    self.send_response(409)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(response)))
+                    self.end_headers()
+                    self.wfile.write(response)
+                    return
+                if ack_epoch < state.epoch:
+                    response = f"Epoch {ack_epoch} was already acknowledged\n".encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(response)))
+                    self.end_headers()
+                    self.wfile.write(response)
+                    return
+                if not state.trajectory_is_ready():
+                    response = f"DAPO data for epoch {state.epoch} has not been received\n".encode()
+                    self.send_response(409)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(response)))
+                    self.end_headers()
+                    self.wfile.write(response)
+                    return
                 self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(b"ACK received\n")))
                 self.end_headers()
                 self.wfile.write(b"ACK received\n")
                 state.request_stop("ACK received on listener")
@@ -490,6 +699,125 @@ def make_ack_handler(state: RuntimeState) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(b"Expected ACK\n")
 
     return AckHandler
+
+
+def make_trajectory_upload_handler(state: RuntimeState) -> type[BaseHTTPRequestHandler]:
+    class TrajectoryUploadHandler(BaseHTTPRequestHandler):
+        server_version = "DAPOUploadServer/1.0"
+
+        def do_POST(self) -> None:
+            self._handle_upload()
+
+        def do_PUT(self) -> None:
+            self._handle_upload()
+
+        def log_message(self, fmt: str, *args: object) -> None:
+            print(
+                f"{self.address_string()} - {fmt % args}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        def _send_text(self, status: int, message: str) -> None:
+            body = message.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _handle_upload(self) -> None:
+            if urlparse(self.path).path.rstrip("/") != "/dapo":
+                self._send_text(404, "Expected /dapo\n")
+                return
+            if "application/json" not in self.headers.get("Content-Type", "").lower():
+                self._send_text(415, "Expected Content-Type: application/json\n")
+                return
+
+            try:
+                upload_epoch = int(self.headers.get("X-DAPO-Epoch", ""))
+            except ValueError:
+                self._send_text(400, "X-DAPO-Epoch must be an integer\n")
+                return
+            if upload_epoch != state.epoch:
+                self._send_text(409, f"Expected epoch {state.epoch}, got {upload_epoch}\n")
+                return
+
+            expected_checksum = self.headers.get("X-DAPO-SHA256", "").lower()
+            if len(expected_checksum) != 64 or any(
+                character not in "0123456789abcdef" for character in expected_checksum
+            ):
+                self._send_text(400, "X-DAPO-SHA256 must be a hexadecimal SHA-256 digest\n")
+                return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", ""))
+            except ValueError:
+                self._send_text(411, "A valid Content-Length is required\n")
+                return
+            if content_length <= 0:
+                self._send_text(411, "Content-Length must be positive\n")
+                return
+
+            if not state.upload_lock.acquire(blocking=False):
+                self._send_text(409, "Another DAPO upload is in progress\n")
+                return
+
+            incoming_dir = state.dapo_path.parent / ".incoming"
+            temporary_path = incoming_dir / f"dapo.epoch_{upload_epoch}.{threading.get_ident()}.tmp"
+            try:
+                incoming_dir.mkdir(parents=True, exist_ok=True)
+                digest = hashlib.sha256()
+                remaining = content_length
+                with temporary_path.open("wb") as output_file:
+                    while remaining:
+                        chunk = self.rfile.read(min(UPLOAD_CHUNK_SIZE, remaining))
+                        if not chunk:
+                            raise ValueError(
+                                f"Upload ended early with {remaining} of {content_length} bytes missing"
+                            )
+                        output_file.write(chunk)
+                        digest.update(chunk)
+                        remaining -= len(chunk)
+                    output_file.flush()
+                    os.fsync(output_file.fileno())
+
+                actual_checksum = digest.hexdigest()
+                if not hmac.compare_digest(actual_checksum, expected_checksum):
+                    raise ValueError(
+                        f"SHA-256 mismatch: expected {expected_checksum}, got {actual_checksum}"
+                    )
+
+                try:
+                    with temporary_path.open("r", encoding="utf-8") as input_file:
+                        dapo_data = json.load(input_file)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError("Uploaded file is not valid UTF-8 DAPO JSON") from exc
+                validate_dapo_data(dapo_data)
+
+                state.dapo_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(temporary_path, state.dapo_path)
+                directory_fd = os.open(state.dapo_path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+                state.mark_trajectory_ready(upload_epoch, actual_checksum)
+                print(
+                    f"Received epoch {upload_epoch} DAPO data at {state.dapo_path}, "
+                    f"bytes={content_length}, sha256={actual_checksum}",
+                    flush=True,
+                )
+                self._send_text(201, "DAPO data received\n")
+            except ValueError as exc:
+                self._send_text(400, f"Invalid DAPO upload: {exc}\n")
+            except OSError as exc:
+                self._send_text(500, f"Failed to store DAPO upload: {exc}\n")
+            finally:
+                temporary_path.unlink(missing_ok=True)
+                state.upload_lock.release()
+
+    return TrajectoryUploadHandler
 
 
 def format_command(command: list[str]) -> str:
@@ -556,11 +884,13 @@ def main(argv: list[str]) -> int:
         raise RuntimeError(f"CPU_MACHINE_URL is not set in {ENV_PATH}")
 
     vllm_port = resolve_vllm_port(args.vllm_port, env_values)
+    trajectory_upload_port = resolve_trajectory_upload_port(args.trajectory_upload_port, env_values)
+    dapo_path = args.dapo_json.expanduser().resolve()
     backend_args = make_backend_args(backend_args, args.model, vllm_port)
 
     backend_script = resolve_backend_script(args.backend_script)
     process = start_backend(backend_script, backend_args)
-    state = RuntimeState(process, args.stop_timeout)
+    state = RuntimeState(process, args.stop_timeout, epoch=args.epoch, dapo_path=dapo_path)
 
     try:
         def handle_signal(signum: int, _frame: object) -> None:
@@ -578,28 +908,49 @@ def main(argv: list[str]) -> int:
 
         wait_for_vllm_health(process, vllm_port)
 
+        if not send_ack_until_received(
+            cpu_machine_url,
+            args.ack_timeout,
+            args.ack_retry_interval,
+            epoch=args.epoch,
+            shutdown_event=state.shutdown_event,
+            process=process,
+        ):
+            state.wait_for_stop()
+            if process.poll() is None:
+                stop_backend(process, args.stop_timeout, "ACK retry loop stopped")
+            return process.returncode if process.returncode is not None else 1
+
         handler = make_ack_handler(state)
         httpd = ThreadingHTTPServer((args.listen_host, args.listen_port), handler)
         state.httpd = httpd
-
-        if not send_ack(cpu_machine_url, args.ack_timeout, args.ack_retries):
-            print(
-                "Failed to send ACK to CPU machine; continuing to listen",
-                file=sys.stderr,
-            )
+        upload_handler = make_trajectory_upload_handler(state)
+        upload_httpd = ThreadingHTTPServer(
+            (args.trajectory_upload_host, trajectory_upload_port),
+            upload_handler,
+        )
+        state.upload_httpd = upload_httpd
 
         print(
             f"Listening for ACK on {args.listen_host}:{args.listen_port}",
             flush=True,
         )
+        print(
+            f"Listening for epoch {args.epoch} DAPO upload on "
+            f"{args.trajectory_upload_host}:{trajectory_upload_port}",
+            flush=True,
+        )
+        upload_thread = threading.Thread(target=upload_httpd.serve_forever, daemon=True)
+        upload_thread.start()
 
         try:
             httpd.serve_forever()
         finally:
-            httpd.server_close()
             if process.poll() is None:
                 state.request_stop("Server exiting")
-                state.wait_for_stop()
+            state.wait_for_stop()
+            httpd.server_close()
+            upload_httpd.server_close()
     except Exception:
         if process.poll() is None:
             stop_backend(process, args.stop_timeout, "Server failed")

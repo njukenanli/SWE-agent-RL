@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import http.client
+import json
+import math
 import os
 import queue
 import signal
@@ -10,9 +14,12 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
+
+from ruamel.yaml import YAML
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -21,6 +28,10 @@ SWEAGENT_DIR = SCRIPT_DIR / "sweagent"
 LOG_PATH = SCRIPT_DIR / "log.out"
 ACK_PAYLOAD = "ACK"
 DEFAULT_HOST = "0.0.0.0"
+DEFAULT_ACK_RETRY_INTERVAL = 60.0
+DEFAULT_TRAJECTORY_UPLOAD_TIMEOUT = 60 * 60
+DEFAULT_TRAJECTORY_UPLOAD_RETRIES = 3
+UPLOAD_CHUNK_SIZE = 1024 * 1024
 
 
 def parse_dotenv(path: Path) -> dict[str, str]:
@@ -95,7 +106,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="Path to the SWE-bench JSONL dataset.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--ack-retry-interval",
+        type=float,
+        default=DEFAULT_ACK_RETRY_INTERVAL,
+        help="Seconds between GPU completion ACK attempts. Default: 60.",
+    )
+    args = parser.parse_args(argv)
+    if args.ack_retry_interval < 0:
+        parser.error("--ack-retry-interval must be non-negative")
+    return args
 
 
 def is_ack_request(path: str, body: bytes) -> bool:
@@ -116,17 +136,326 @@ def is_ack_request(path: str, body: bytes) -> bool:
     )
 
 
-def send_ack(gpu_machine_url: str, timeout: float = 5.0) -> None:
-    request = Request(
-        gpu_machine_url,
-        data=ACK_PAYLOAD.encode("utf-8"),
-        method="POST",
-        headers={"Content-Type": "text/plain; charset=utf-8"},
-    )
+def send_ack_until_received(
+    gpu_machine_url: str,
+    *,
+    epoch: int,
+    shutdown_event: threading.Event,
+    timeout: float = 5.0,
+    retry_interval: float = DEFAULT_ACK_RETRY_INTERVAL,
+) -> bool:
+    if retry_interval < 0:
+        raise ValueError("ACK retry interval must be non-negative")
 
-    with urlopen(request, timeout=timeout) as response:
-        response.read(256)
-        print(f"Sent ACK to GPU machine, status={response.status}", flush=True)
+    payload = ACK_PAYLOAD.encode("utf-8")
+    attempt = 0
+    while not shutdown_event.is_set():
+        attempt += 1
+        request = Request(
+            gpu_machine_url,
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "text/plain; charset=utf-8",
+                "X-DAPO-Epoch": str(epoch),
+            },
+        )
+
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                response.read(256)
+                if response.status == 200:
+                    print(
+                        f"GPU machine received epoch {epoch} completion ACK, "
+                        f"status=200, attempt={attempt}",
+                        flush=True,
+                    )
+                    return True
+                failure = f"unexpected HTTP status {response.status}"
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            failure = str(exc)
+
+        if shutdown_event.is_set():
+            break
+        print(
+            f"GPU completion ACK attempt {attempt} for epoch {epoch} failed: {failure}; "
+            f"retrying in {retry_interval:g} seconds",
+            file=sys.stderr,
+            flush=True,
+        )
+        if shutdown_event.wait(retry_interval):
+            break
+
+    return False
+
+
+def get_success(model: str, epoch: int, mode: Literal["train", "test"]) -> tuple[int, int, float]:
+    trajectory_dir = SWEAGENT_DIR / "logs" / model / str(epoch) / mode
+    trajectory_paths: list[Path] = []
+    if trajectory_dir.is_dir():
+        for instance_dir in trajectory_dir.iterdir():
+            if not instance_dir.is_dir():
+                continue
+            for sample_dir in instance_dir.iterdir():
+                if sample_dir.is_dir() and sample_dir.name.isdecimal():
+                    trajectory_paths.append(sample_dir / f"{instance_dir.name}.traj")
+
+    total = len(trajectory_paths)
+    success = 0
+
+    for trajectory_path in trajectory_paths:
+        try:
+            trajectory_data = json.loads(trajectory_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            # Empty and malformed trajectories still count as executed samples,
+            # but cannot count as successful ones.
+            continue
+
+        if (
+            isinstance(trajectory_data, dict)
+            and isinstance(trajectory_data.get("info"), dict)
+            and trajectory_data["info"].get("success") is True
+        ):
+            success += 1
+
+    success_rate = round(success / total * 100, 2) if total else 0.0
+    print(
+        f"Epoch: {epoch}, Num of successful samples: {success}, "
+        f"Num of all samples executed: {total}, Success rate: {success_rate}",
+        flush=True,
+    )
+    return success, total, success_rate
+
+
+def _get_model_name(config_path: Path) -> str:
+    config = YAML(typ="safe").load(config_path.read_text(encoding="utf-8"))
+    try:
+        model = config["agent"]["model"]["name"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"Could not find agent.model.name in {config_path}") from exc
+    if not isinstance(model, str) or not model:
+        raise ValueError(f"agent.model.name in {config_path} must be a non-empty string")
+    return model
+
+
+def _get_sample_count(config_path: Path) -> int:
+    config = YAML(typ="safe").load(config_path.read_text(encoding="utf-8"))
+    try:
+        samples = config["agent"]["model"]["samples"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"Could not find agent.model.samples in {config_path}") from exc
+    if isinstance(samples, bool) or not isinstance(samples, int) or samples < 1:
+        raise ValueError(f"agent.model.samples in {config_path} must be a positive integer")
+    return samples
+
+
+def _read_token_ids(value: object, field: str, trajectory_path: Path, step_index: int) -> list[int]:
+    if not isinstance(value, list):
+        raise ValueError(f"{trajectory_path}: trajectory step {step_index} {field} must be a list")
+    if any(isinstance(token_id, bool) or not isinstance(token_id, int) for token_id in value):
+        raise ValueError(f"{trajectory_path}: trajectory step {step_index} {field} must contain integers")
+    return value
+
+
+def _read_probabilities(value: object, trajectory_path: Path, step_index: int) -> list[float]:
+    if not isinstance(value, list):
+        raise ValueError(
+            f"{trajectory_path}: trajectory step {step_index} output_token_probabilities must be a list"
+        )
+
+    probabilities: list[float] = []
+    for probability in value:
+        if isinstance(probability, bool) or not isinstance(probability, (int, float)):
+            raise ValueError(
+                f"{trajectory_path}: trajectory step {step_index} "
+                "output_token_probabilities must contain numbers"
+            )
+        try:
+            probability = float(probability)
+        except OverflowError as exc:
+            raise ValueError(
+                f"{trajectory_path}: trajectory step {step_index} has an invalid probability"
+            ) from exc
+        if not math.isfinite(probability) or not 0.0 <= probability <= 1.0:
+            raise ValueError(
+                f"{trajectory_path}: trajectory step {step_index} has probability outside [0, 1]: "
+                f"{probability}"
+            )
+        probabilities.append(probability)
+    return probabilities
+
+
+def _convert_trajectory(trajectory_path: Path) -> list[list[object]]:
+    try:
+        trajectory_data = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read trajectory JSON: {trajectory_path}") from exc
+    if not isinstance(trajectory_data, dict):
+        raise ValueError(f"{trajectory_path}: trajectory file must contain a JSON object")
+
+    info = trajectory_data.get("info")
+    if not isinstance(info, dict) or not isinstance(info.get("success"), bool):
+        raise ValueError(f"{trajectory_path}: info.success must be a boolean")
+    reward = int(info["success"])
+
+    trajectory = trajectory_data.get("trajectory", [])
+    if not isinstance(trajectory, list):
+        raise ValueError(f"{trajectory_path}: trajectory must be a list")
+
+    converted: list[list[object]] = []
+    for step_index, step in enumerate(trajectory, start=1):
+        if not isinstance(step, dict):
+            raise ValueError(f"{trajectory_path}: trajectory step {step_index} must be an object")
+
+        input_token_ids = _read_token_ids(
+            step.get("input_token_ids"), "input_token_ids", trajectory_path, step_index
+        )
+        output_token_ids = _read_token_ids(
+            step.get("output_token_ids"), "output_token_ids", trajectory_path, step_index
+        )
+        probabilities = _read_probabilities(
+            step.get("output_token_probabilities"), trajectory_path, step_index
+        )
+        if len(output_token_ids) != len(probabilities):
+            raise ValueError(
+                f"{trajectory_path}: trajectory step {step_index} has "
+                f"{len(output_token_ids)} output token IDs but {len(probabilities)} probabilities"
+            )
+
+        output_pairs = [list(pair) for pair in zip(output_token_ids, probabilities, strict=True)]
+        converted.append([input_token_ids, output_pairs, reward])
+    return converted
+
+
+def collect_dapo_trajectories(*, model: str, epoch: int, samples: int) -> list[list[list[list[object]]]]:
+    model_path = Path(model)
+    if model_path.is_absolute() or ".." in model_path.parts:
+        raise ValueError(f"Model name must be a safe relative path, got {model!r}")
+
+    train_dir = SWEAGENT_DIR / "logs" / model_path / str(epoch) / "train"
+    if not train_dir.is_dir():
+        raise FileNotFoundError(f"Current epoch train trajectory directory does not exist: {train_dir}")
+
+    instance_dirs = sorted(path for path in train_dir.iterdir() if path.is_dir())
+    if not instance_dirs:
+        raise ValueError(f"No training instances found in {train_dir}")
+
+    expected_sample_ids = set(range(samples))
+    groups: list[list[list[list[object]]]] = []
+    for instance_dir in instance_dirs:
+        sample_dirs = [path for path in instance_dir.iterdir() if path.is_dir() and path.name.isdecimal()]
+        actual_sample_ids = {int(path.name) for path in sample_dirs}
+        if actual_sample_ids != expected_sample_ids or len(sample_dirs) != samples:
+            raise ValueError(
+                f"{instance_dir}: expected sample directories 0..{samples - 1}, "
+                f"found {sorted(actual_sample_ids)}"
+            )
+
+        group: list[list[list[object]]] = []
+        for sample_id in range(samples):
+            trajectory_path = instance_dir / str(sample_id) / f"{instance_dir.name}.traj"
+            if not trajectory_path.is_file():
+                raise FileNotFoundError(f"Missing trajectory: {trajectory_path}")
+            group.append(_convert_trajectory(trajectory_path))
+        groups.append(group)
+    return groups
+
+
+def write_dapo_json(*, model: str, epoch: int, samples: int) -> Path:
+    train_dir = SWEAGENT_DIR / "logs" / model / str(epoch) / "train"
+    dapo_path = train_dir / "dapo.json"
+    temporary_path = train_dir / ".dapo.json.tmp"
+    groups = collect_dapo_trajectories(model=model, epoch=epoch, samples=samples)
+
+    try:
+        with temporary_path.open("w", encoding="utf-8") as output_file:
+            json.dump(groups, output_file, ensure_ascii=False, separators=(",", ":"))
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        os.replace(temporary_path, dapo_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+    trajectory_count = sum(len(group) for group in groups)
+    step_count = sum(len(trajectory) for group in groups for trajectory in group)
+    print(
+        f"Wrote DAPO data for epoch {epoch} to {dapo_path}: "
+        f"groups={len(groups)}, trajectories={trajectory_count}, steps={step_count}",
+        flush=True,
+    )
+    return dapo_path
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as input_file:
+        while chunk := input_file.read(UPLOAD_CHUNK_SIZE):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def upload_dapo_json(
+    upload_url: str,
+    dapo_path: Path,
+    *,
+    epoch: int,
+    timeout: float = DEFAULT_TRAJECTORY_UPLOAD_TIMEOUT,
+    retries: int = DEFAULT_TRAJECTORY_UPLOAD_RETRIES,
+) -> None:
+    parsed = urlparse(upload_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"TRAJECTORY_UPLOAD_URL must be an HTTP(S) URL, got {upload_url!r}")
+    if parsed.username is not None or parsed.password is not None or parsed.fragment:
+        raise ValueError("TRAJECTORY_UPLOAD_URL must not contain credentials or a fragment")
+    if timeout <= 0:
+        raise ValueError("trajectory upload timeout must be positive")
+
+    request_path = parsed.path if parsed.path not in {"", "/"} else "/dapo"
+    if parsed.query:
+        request_path = f"{request_path}?{parsed.query}"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    file_size = dapo_path.stat().st_size
+    checksum = _sha256(dapo_path)
+    connection_type = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+
+    retries = max(retries, 1)
+    for attempt in range(1, retries + 1):
+        connection = connection_type(parsed.hostname, port, timeout=timeout)
+        try:
+            connection.putrequest("PUT", request_path)
+            connection.putheader("Content-Type", "application/json")
+            connection.putheader("Content-Length", str(file_size))
+            connection.putheader("X-DAPO-Epoch", str(epoch))
+            connection.putheader("X-DAPO-SHA256", checksum)
+            connection.endheaders()
+            with dapo_path.open("rb") as input_file:
+                while chunk := input_file.read(UPLOAD_CHUNK_SIZE):
+                    connection.send(chunk)
+
+            response = connection.getresponse()
+            response_body = response.read(4096).decode("utf-8", errors="replace").strip()
+            if 200 <= response.status < 300:
+                print(
+                    f"Uploaded epoch {epoch} DAPO data to {upload_url}, "
+                    f"bytes={file_size}, status={response.status}",
+                    flush=True,
+                )
+                return
+            raise RuntimeError(
+                f"trajectory upload returned HTTP {response.status}: {response_body or response.reason}"
+            )
+        except (http.client.HTTPException, OSError) as exc:
+            if attempt >= retries:
+                raise RuntimeError(
+                    f"Failed to upload epoch {epoch} DAPO data after {retries} attempt(s): {exc}"
+                ) from exc
+            print(
+                f"Trajectory upload attempt {attempt}/{retries} failed: {exc}; retrying",
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            connection.close()
 
 
 def run_sweagent(
@@ -151,13 +480,15 @@ def run_sweagent(
         "--epoch",
         str(epoch),
     ]
-    commands = [
-        ["sweagent", "run-batch", "--config", "config/test.yaml", *common_args],
-        ["sweagent", "run-batch", "--config", "config/train.yaml", *common_args],
+    jobs: list[tuple[Literal["train", "test"], Path]] = [
+        ("test", Path("config/test.yaml")),
+        ("train", Path("config/train.yaml")),
     ]
 
     with LOG_PATH.open("a", encoding="utf-8") as log_file:
-        for command in commands:
+        for mode, config_path in jobs:
+            model = _get_model_name(SWEAGENT_DIR / config_path)
+            command = ["sweagent", "run-batch", "--config", str(config_path), *common_args]
             print(
                 f"Running {' '.join(command)}; output redirected to {LOG_PATH}",
                 flush=True,
@@ -171,17 +502,10 @@ def run_sweagent(
                 check=True,
             )
             log_file.flush()
+            get_success(model, epoch, mode)
 
 
-def drain_ack_queue(ack_queue: queue.Queue[None]) -> None:
-    while True:
-        try:
-            ack_queue.get_nowait()
-        except queue.Empty:
-            return
-
-
-def make_ack_handler(ack_queue: queue.Queue[None]) -> type[BaseHTTPRequestHandler]:
+def make_ack_handler(ack_queue: queue.Queue[int]) -> type[BaseHTTPRequestHandler]:
     class AckHandler(BaseHTTPRequestHandler):
         server_version = "CPUAckServer/1.0"
 
@@ -203,10 +527,32 @@ def make_ack_handler(ack_queue: queue.Queue[None]) -> type[BaseHTTPRequestHandle
             body = self.rfile.read(content_length) if content_length > 0 else b""
 
             if is_ack_request(self.path, body):
-                ack_queue.put(None)
+                try:
+                    epoch = int(self.headers.get("X-DAPO-Epoch", ""))
+                except ValueError:
+                    response = b"X-DAPO-Epoch must be an integer\n"
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(response)))
+                    self.end_headers()
+                    self.wfile.write(response)
+                    return
+                if epoch < 0:
+                    response = b"X-DAPO-Epoch must be non-negative\n"
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(response)))
+                    self.end_headers()
+                    self.wfile.write(response)
+                    return
+
+                ack_queue.put(epoch)
+                response = f"ACK received for epoch {epoch}\n".encode()
                 self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(response)))
                 self.end_headers()
-                self.wfile.write(b"ACK received\n")
+                self.wfile.write(response)
                 return
 
             self.send_response(400)
@@ -223,6 +569,7 @@ def main(argv: list[str] | None = None) -> int:
     cpu_machine_port = env_values.get("CPU_MACHINE_PORT")
     llm_api_key = env_values.get("LLM_API_KEY")
     llm_api_base = env_values.get("LLM_API_BASE")
+    trajectory_upload_url = env_values.get("TRAJECTORY_UPLOAD_URL")
 
     if not gpu_machine_url:
         raise RuntimeError(f"GPU_MACHINE_URL is not set in {ENV_PATH}")
@@ -232,9 +579,15 @@ def main(argv: list[str] | None = None) -> int:
         raise RuntimeError(f"LLM_API_KEY is not set in {ENV_PATH}")
     if not llm_api_base:
         raise RuntimeError(f"LLM_API_BASE is not set in {ENV_PATH}")
+    if not trajectory_upload_url:
+        raise RuntimeError(f"TRAJECTORY_UPLOAD_URL is not set in {ENV_PATH}")
 
     port = parse_port(cpu_machine_port)
-    ack_queue: queue.Queue[None] = queue.Queue()
+    train_config_path = SWEAGENT_DIR / "config/train.yaml"
+    train_model = _get_model_name(train_config_path)
+    train_samples = _get_sample_count(train_config_path)
+    ack_queue: queue.Queue[int] = queue.Queue()
+    pending_ack_epochs: set[int] = set()
     httpd = ThreadingHTTPServer((DEFAULT_HOST, port), make_ack_handler(ack_queue))
     stop_event = threading.Event()
 
@@ -252,16 +605,25 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         while not stop_event.is_set():
-            drain_ack_queue(ack_queue)
-            print("Waiting for ACK from GPU machine", flush=True)
-            while not stop_event.is_set():
+            expected_epoch = iteration_num - 1
+            print(f"Waiting for GPU readiness ACK for epoch {expected_epoch}", flush=True)
+            while expected_epoch not in pending_ack_epochs and not stop_event.is_set():
                 try:
-                    ack_queue.get(timeout=1.0)
-                    break
+                    ack_epoch = ack_queue.get(timeout=1.0)
                 except queue.Empty:
                     continue
+                if ack_epoch < expected_epoch:
+                    print(
+                        f"Ignoring stale GPU readiness ACK for epoch {ack_epoch}; "
+                        f"waiting for epoch {expected_epoch}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    pending_ack_epochs.add(ack_epoch)
             if stop_event.is_set():
                 break
+            pending_ack_epochs.remove(expected_epoch)
 
             print(f"ACK received; starting iteration {iteration_num}", flush=True)
             run_sweagent(
@@ -271,13 +633,18 @@ def main(argv: list[str] | None = None) -> int:
                 llm_api_key=llm_api_key,
                 llm_api_base=llm_api_base,
             )
+            epoch = iteration_num - 1
+            dapo_path = write_dapo_json(model=train_model, epoch=epoch, samples=train_samples)
+            upload_dapo_json(trajectory_upload_url, dapo_path, epoch=epoch)
 
-            try:
-                send_ack(gpu_machine_url)
-            except (HTTPError, URLError, TimeoutError, OSError) as exc:
-                print(f"Failed to send ACK to GPU machine: {exc}", file=sys.stderr)
-            else:
-                iteration_num += 1
+            if not send_ack_until_received(
+                gpu_machine_url,
+                epoch=epoch,
+                shutdown_event=stop_event,
+                retry_interval=args.ack_retry_interval,
+            ):
+                break
+            iteration_num += 1
     finally:
         stop_event.set()
         httpd.shutdown()
