@@ -3,6 +3,27 @@ This repo provides a minimal framework to sample SWE-agent trajectories and do R
 
 View [docs/demo.pdf](./docs/demo.pdf) for detailed algorithm explanation.
 
+## Workflow
+
+```
+GPU side:
+    vllm serves base model
+    gpu side sends ACK to cpu side
+CPU side:
+    cpu side receives ACK from gpu side
+    sweagent run test set with no sampling
+    run swebench eval and report success rate on test set
+    sweagent run training set with batch_size(=64) and num_samples(=8)
+    run swebench eval and report success rate on training set
+    send trajectories of training set with I/O token ids and output probabilities, and eval result to GPU side
+GPU side:
+    run RL (dapo) on received trajectories with rewards of success state
+    vllm serves the updated model
+    gpu side sends ACK to cpu side
+CPU side:
+    loop with the same procedure ...
+```
+
 ## Environment setup
 
 ```
