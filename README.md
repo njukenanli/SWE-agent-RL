@@ -5,6 +5,10 @@ View [docs/demo.pdf](./docs/demo.pdf) for detailed algorithm explanation.
 
 ## Environment setup
 
+```
+git clone --recursive https://github.com/njukenanli/SWE-agent-RL
+```
+
 ### On CPU side
 
 The CPU machine must be a physical machine or AWS VM that allows running docker inside. Containerized pods cannot run docker.
@@ -96,6 +100,8 @@ bash cpu/tunnel.sh
 ```
 
 ### On CPU side
+
+First, modify training and test configs in `cpu/sweagent/config/train.yaml` and `cpu/sweagent/config/test.yaml` to control SWE-agent behavior.
 
 ```bash
 cd cpu
