@@ -2,16 +2,18 @@
 set -euo pipefail
 
 EPOCH=""
+START_EPOCH="0"
 DATA_DIR=""
 INITIAL_MODEL="Qwen/Qwen3.5-4B"
 
 usage() {
   cat <<'USAGE'
 Usage:
-  bash main.sh --epoch N --data-dir PATH
+  bash main.sh --epoch N --data-dir PATH [--start_epoch N]
 
 Options:
-  --epoch N          Number of sequential vLLM + DAPO epochs to run.
+  --epoch N          Total target epoch count; the final epoch is N-1.
+  --start_epoch N    First zero-based epoch to run. Default: 0.
   --data-dir PATH    Root directory for model/epoch_N HF models and checkpoints.
   -h, --help         Show this help.
 USAGE
@@ -21,6 +23,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --epoch)
       EPOCH="${2:?missing value for --epoch}"
+      shift 2
+      ;;
+    --start_epoch)
+      START_EPOCH="${2:?missing value for --start_epoch}"
       shift 2
       ;;
     --data-dir)
@@ -56,6 +62,16 @@ if ! [[ "$EPOCH" =~ ^[0-9]+$ ]] || [[ "$EPOCH" -lt 1 ]]; then
   exit 2
 fi
 
+if ! [[ "$START_EPOCH" =~ ^[0-9]+$ ]]; then
+  echo "--start_epoch must be a non-negative integer, got: $START_EPOCH" >&2
+  exit 2
+fi
+
+if [[ "$START_EPOCH" -ge "$EPOCH" ]]; then
+  echo "--start_epoch must be less than --epoch, got: $START_EPOCH >= $EPOCH" >&2
+  exit 2
+fi
+
 mkdir -p "$DATA_DIR/model" "$DATA_DIR/checkpoints"
 DATA_DIR="$(cd "$DATA_DIR" && pwd)"
 
@@ -88,9 +104,16 @@ validate_hf_model() {
   fi
 }
 
-MODEL_PATH="$INITIAL_MODEL"
+if [[ "$START_EPOCH" -eq 0 ]]; then
+  MODEL_PATH="$INITIAL_MODEL"
+else
+  PREVIOUS_EPOCH=$((START_EPOCH - 1))
+  MODEL_PATH="$DATA_DIR/model/epoch_$PREVIOUS_EPOCH"
+  validate_hf_model "$MODEL_PATH"
+  echo "Resuming at epoch $START_EPOCH with model from epoch $PREVIOUS_EPOCH: $MODEL_PATH"
+fi
 
-for ((epoch = 0; epoch < EPOCH; epoch++)); do
+for ((epoch = START_EPOCH; epoch < EPOCH; epoch++)); do
   CHECKPOINT_PATH="$DATA_DIR/checkpoints/epoch_$epoch"
   HF_EXPORT_PATH="$CHECKPOINT_PATH/global_step_1/model/huggingface"
   MODEL_SAVE_PATH="$DATA_DIR/model/epoch_$epoch"

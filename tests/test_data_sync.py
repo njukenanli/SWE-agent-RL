@@ -54,6 +54,7 @@ def test_cpu_cli_and_sweagent_command_use_num_workers(tmp_path, monkeypatch):
     assert args.train_set == train_set.resolve()
     assert args.test_set == test_set.resolve()
     assert args.batch_size == 1
+    assert args.start_epoch == 0
 
     commands = []
     train_dataset = tmp_path / "temp.jsonl"
@@ -86,6 +87,51 @@ def test_cpu_cli_and_sweagent_command_use_num_workers(tmp_path, monkeypatch):
     train_subset_index = train_command.index("--instances.subset")
     assert test_command[test_subset_index + 1] == str(test_set)
     assert train_command[train_subset_index + 1] == str(train_dataset)
+
+
+def test_cpu_cli_accepts_nonzero_start_epoch(tmp_path):
+    train_set = tmp_path / "train.jsonl"
+    test_set = tmp_path / "test.jsonl"
+    train_set.write_text('{"instance_id":"train-task-0"}\n', encoding="utf-8")
+    test_set.write_text('{"instance_id":"test-task-0"}\n', encoding="utf-8")
+
+    args = cpu_main.parse_args(
+        [
+            "--num_workers",
+            "1",
+            "--train_set",
+            str(train_set),
+            "--test_set",
+            str(test_set),
+            "--batch_size",
+            "1",
+            "--start_epoch",
+            "7",
+        ]
+    )
+
+    assert args.start_epoch == 7
+
+
+def test_cpu_cli_rejects_negative_start_epoch(tmp_path):
+    dataset = tmp_path / "dataset.jsonl"
+    dataset.write_text('{"instance_id":"task-0"}\n', encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        cpu_main.parse_args(
+            [
+                "--num_workers",
+                "1",
+                "--train_set",
+                str(dataset),
+                "--test_set",
+                str(dataset),
+                "--batch_size",
+                "1",
+                "--start_epoch",
+                "-1",
+            ]
+        )
 
 
 @pytest.mark.parametrize(

@@ -102,9 +102,10 @@ cd cpu
 
 python main.py \
   --num_workers 1 \
-  --train_set train.jsonl \
-  --test_set test.jsonl \
-  --batch_size 64
+  --train_set sweagent/datasets/verified-431.jsonl \
+  --test_set sweagent/datasets/verified-50.jsonl \
+  --batch_size 64 \
+  --start_epoch 0
 ```
 
 The sweagent side waits until GPU side is ready (receives ACK from GPU side) and start rollout.
@@ -131,7 +132,18 @@ In side the container specified above:
 ```bash
 cd gpu
 
-bash main.sh --epoch 120 --data-dir /Data
+bash main.sh \
+  --epoch 120 \
+  --data-dir /Data \
+  --start_epoch 0
 ```
 
 The code starts vllm, until CPU side sends ACK -- rollout ends and the cpu side uploads trajs to the gpu side. Then it starts verl training. When training ends the vllm is started again from the updated LM weights.
+
+`--start_epoch` defaults to `0` on both machines. Set it to the same non-zero
+value on the CPU and GPU to resume an interrupted run. For example,
+`--epoch 120 --start_epoch 37` runs epochs 37 through 119. The GPU validates
+and loads `/Data/model/epoch_36` for the first resumed rollout instead of the
+base model. The previous model and checkpoint directories must remain under
+the same `--data-dir`. The CPU uses epoch 37 for its dataset selection, output
+directories, trajectory upload, and ACK handshake.

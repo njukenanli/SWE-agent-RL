@@ -92,6 +92,16 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def non_negative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected an integer, got: {value!r}") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got: {parsed}")
+    return parsed
+
+
 def existing_file(value: str) -> Path:
     path = Path(value).expanduser().resolve()
     if not path.is_file():
@@ -124,6 +134,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=positive_int,
         required=True,
         help="Number of dataset instances to use for each epoch.",
+    )
+    parser.add_argument(
+        "--start_epoch",
+        type=non_negative_int,
+        default=0,
+        help="First zero-based epoch to run. Default: 0.",
     )
     parser.add_argument(
         "--ack-retry-interval",
@@ -684,7 +700,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Listening for ACK on {DEFAULT_HOST}:{port}", flush=True)
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
-    iteration_num = 1
+    iteration_num = args.start_epoch + 1
 
     try:
         while not stop_event.is_set():
