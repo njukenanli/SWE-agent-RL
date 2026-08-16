@@ -26,6 +26,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR / ".env"
 SWEAGENT_DIR = SCRIPT_DIR / "sweagent"
 LOG_PATH = SCRIPT_DIR / "log.out"
+TEMP_DATASET_PATH = SWEAGENT_DIR / "temp.jsonl"
 ACK_PAYLOAD = "ACK"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_ACK_RETRY_INTERVAL = 60.0
@@ -95,16 +96,28 @@ def existing_file(value: str) -> Path:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--parallel_instances",
+        "--num_workers",
         type=positive_int,
         required=True,
-        help="Number of SWE-agent task instances to run in parallel.",
+        help="Maximum number of SWE-agent rollouts allowed to run concurrently.",
     )
     parser.add_argument(
-        "--dataset",
+        "--train_set",
         type=existing_file,
         required=True,
-        help="Path to the SWE-bench JSONL dataset.",
+        help="Path to the training JSONL dataset from which each epoch batch is selected.",
+    )
+    parser.add_argument(
+        "--test_set",
+        type=existing_file,
+        required=True,
+        help="Path to the complete test JSONL dataset used in every epoch.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=positive_int,
+        required=True,
+        help="Number of dataset instances to use for each epoch.",
     )
     parser.add_argument(
         "--ack-retry-interval",
@@ -116,6 +129,50 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.ack_retry_interval < 0:
         parser.error("--ack-retry-interval must be non-negative")
     return args
+
+
+def write_epoch_dataset_batch(
+    dataset: Path,
+    *,
+    current_epoch: int,
+    batch_size: int,
+    output_path: Path = TEMP_DATASET_PATH,
+) -> Path:
+    if current_epoch < 0:
+        raise ValueError(f"current_epoch must be non-negative, got: {current_epoch}")
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be positive, got: {batch_size}")
+
+    records = [line for line in dataset.read_text(encoding="utf-8").splitlines() if line.strip()]
+    dataset_size = len(records)
+    if dataset_size == 0:
+        raise ValueError(f"dataset contains no instances: {dataset}")
+    if batch_size > dataset_size:
+        raise ValueError(
+            f"batch_size ({batch_size}) cannot exceed dataset size ({dataset_size})"
+        )
+
+    start = (current_epoch * batch_size) % dataset_size
+    end = ((current_epoch + 1) * batch_size) % dataset_size
+    if start < end:
+        batch = records[start:end]
+    elif start > end:
+        batch = records[start:] + records[:end]
+    else:
+        # With batch_size <= dataset_size, equal modular boundaries mean one
+        # complete pass through the dataset.
+        batch = records[:]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    incoming_path = output_path.with_name(f".{output_path.name}.tmp")
+    incoming_path.write_text("".join(f"{record}\n" for record in batch), encoding="utf-8")
+    os.replace(incoming_path, output_path)
+    print(
+        f"Prepared epoch {current_epoch} dataset batch with {len(batch)} instance(s) "
+        f"from [{start}, {end}) at {output_path}",
+        flush=True,
+    )
+    return output_path
 
 
 def is_ack_request(path: str, body: bytes) -> bool:
@@ -460,8 +517,9 @@ def upload_dapo_json(
 
 def run_sweagent(
     *,
-    parallel_instances: int,
-    dataset: Path,
+    num_workers: int,
+    test_dataset: Path,
+    train_dataset: Path,
     iteration_num: int,
     llm_api_key: str,
     llm_api_base: str,
@@ -471,24 +529,30 @@ def run_sweagent(
     subprocess_env["LLM_API_KEY"] = llm_api_key
     subprocess_env["LLM_API_BASE"] = llm_api_base
     common_args = [
-        "--parallel_instances",
-        str(parallel_instances),
+        "--num_workers",
+        str(num_workers),
         "--instances.type",
         "swe_bench",
-        "--instances.subset",
-        str(dataset),
         "--epoch",
         str(epoch),
     ]
-    jobs: list[tuple[Literal["train", "test"], Path]] = [
-        ("test", Path("config/test.yaml")),
-        ("train", Path("config/train.yaml")),
+    jobs: list[tuple[Literal["train", "test"], Path, Path]] = [
+        ("test", Path("config/test.yaml"), test_dataset),
+        ("train", Path("config/train.yaml"), train_dataset),
     ]
 
     with LOG_PATH.open("a", encoding="utf-8") as log_file:
-        for mode, config_path in jobs:
+        for mode, config_path, mode_dataset in jobs:
             model = _get_model_name(SWEAGENT_DIR / config_path)
-            command = ["sweagent", "run-batch", "--config", str(config_path), *common_args]
+            command = [
+                "sweagent",
+                "run-batch",
+                "--config",
+                str(config_path),
+                *common_args,
+                "--instances.subset",
+                str(mode_dataset),
+            ]
             print(
                 f"Running {' '.join(command)}; output redirected to {LOG_PATH}",
                 flush=True,
@@ -626,9 +690,15 @@ def main(argv: list[str] | None = None) -> int:
             pending_ack_epochs.remove(expected_epoch)
 
             print(f"ACK received; starting iteration {iteration_num}", flush=True)
+            epoch_dataset = write_epoch_dataset_batch(
+                args.train_set,
+                current_epoch=expected_epoch,
+                batch_size=args.batch_size,
+            )
             run_sweagent(
-                parallel_instances=args.parallel_instances,
-                dataset=args.dataset,
+                num_workers=args.num_workers,
+                test_dataset=args.test_set,
+                train_dataset=epoch_dataset,
                 iteration_num=iteration_num,
                 llm_api_key=llm_api_key,
                 llm_api_base=llm_api_base,

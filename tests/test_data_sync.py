@@ -28,6 +28,121 @@ cpu_main = _load_module("rl_cpu_main", ROOT / "cpu/main.py")
 gpu_server = _load_module("rl_gpu_server", ROOT / "gpu/vllm/server.py")
 
 
+def test_default_epoch_dataset_batch_path_is_inside_sweagent():
+    assert cpu_main.TEMP_DATASET_PATH == ROOT / "cpu/sweagent/temp.jsonl"
+
+
+def test_cpu_cli_and_sweagent_command_use_num_workers(tmp_path, monkeypatch):
+    train_set = tmp_path / "train.jsonl"
+    test_set = tmp_path / "test.jsonl"
+    train_set.write_text('{"instance_id":"train-task-0"}\n', encoding="utf-8")
+    test_set.write_text('{"instance_id":"test-task-0"}\n', encoding="utf-8")
+    args = cpu_main.parse_args(
+        [
+            "--num_workers",
+            "7",
+            "--train_set",
+            str(train_set),
+            "--test_set",
+            str(test_set),
+            "--batch_size",
+            "1",
+        ]
+    )
+
+    assert args.num_workers == 7
+    assert args.train_set == train_set.resolve()
+    assert args.test_set == test_set.resolve()
+    assert args.batch_size == 1
+
+    commands = []
+    train_dataset = tmp_path / "temp.jsonl"
+    train_dataset.write_text('{"instance_id":"task-0"}\n', encoding="utf-8")
+    monkeypatch.setattr(cpu_main, "LOG_PATH", tmp_path / "log.out")
+    monkeypatch.setattr(cpu_main, "_get_model_name", lambda _config_path: "model")
+    monkeypatch.setattr(cpu_main, "get_success", lambda *_args: None)
+    monkeypatch.setattr(
+        cpu_main.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command),
+    )
+
+    cpu_main.run_sweagent(
+        num_workers=args.num_workers,
+        test_dataset=test_set,
+        train_dataset=train_dataset,
+        iteration_num=1,
+        llm_api_key="key",
+        llm_api_base="http://localhost:5001",
+    )
+
+    assert len(commands) == 2
+    for command in commands:
+        option_index = command.index("--num_workers")
+        assert command[option_index + 1] == "7"
+        assert "--parallel_instances" not in command
+    test_command, train_command = commands
+    test_subset_index = test_command.index("--instances.subset")
+    train_subset_index = train_command.index("--instances.subset")
+    assert test_command[test_subset_index + 1] == str(test_set)
+    assert train_command[train_subset_index + 1] == str(train_dataset)
+
+
+@pytest.mark.parametrize(
+    ("epoch", "expected_ids"),
+    [
+        (0, ["task-0", "task-1", "task-2"]),
+        (1, ["task-3", "task-4", "task-0"]),
+        (2, ["task-1", "task-2", "task-3"]),
+    ],
+)
+def test_writes_epoch_dataset_batch_with_wraparound(tmp_path, epoch, expected_ids):
+    dataset = tmp_path / "dataset.jsonl"
+    dataset.write_text(
+        "\n".join(json.dumps({"instance_id": f"task-{index}"}) for index in range(5)) + "\n",
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "temp.jsonl"
+
+    result = cpu_main.write_epoch_dataset_batch(
+        dataset,
+        current_epoch=epoch,
+        batch_size=3,
+        output_path=output_path,
+    )
+
+    assert result == output_path
+    records = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+    assert [record["instance_id"] for record in records] == expected_ids
+
+
+def test_epoch_batch_equal_boundaries_select_full_dataset(tmp_path):
+    dataset = tmp_path / "dataset.jsonl"
+    dataset.write_text('{"instance_id":"task-0"}\n\n{"instance_id":"task-1"}\n', encoding="utf-8")
+
+    output_path = cpu_main.write_epoch_dataset_batch(
+        dataset,
+        current_epoch=3,
+        batch_size=2,
+        output_path=tmp_path / "temp.jsonl",
+    )
+
+    assert len(output_path.read_text(encoding="utf-8").splitlines()) == 2
+
+
+def test_epoch_batch_rejects_batch_larger_than_dataset(tmp_path):
+    dataset = tmp_path / "dataset.jsonl"
+    dataset.write_text('{"instance_id":"task-0"}\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="cannot exceed dataset size"):
+        cpu_main.write_epoch_dataset_batch(
+            dataset,
+            current_epoch=0,
+            batch_size=2,
+            output_path=tmp_path / "temp.jsonl",
+        )
+
+
 def _write_trajectory(
     train_dir: Path,
     instance_id: str,
