@@ -115,7 +115,7 @@ for ((epoch = 0; epoch < EPOCH; epoch++)); do
       --train-parquet dapo.parquet \
       --model-path "$MODEL_PATH" \
       --save-path "$CHECKPOINT_PATH" \
-      --num-groups 64 \
+      --num-groups 0 \
       --nproc 8 \
       --tp 1 \
       --pp 1 \

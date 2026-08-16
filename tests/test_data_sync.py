@@ -6,7 +6,7 @@ import queue
 import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -206,6 +206,32 @@ def test_collects_current_epoch_train_trajectories_in_dapo_format(tmp_path, monk
     ]
 
 
+def test_collection_inserts_placeholders_for_missing_samples(tmp_path, monkeypatch, capsys):
+    sweagent_dir = tmp_path / "sweagent"
+    train_dir = sweagent_dir / "logs/model/0/train"
+    monkeypatch.setattr(cpu_main, "SWEAGENT_DIR", sweagent_dir)
+    _write_trajectory(
+        train_dir,
+        "instance-a",
+        0,
+        success=True,
+        input_ids=[10],
+        output_ids=[20],
+        probabilities=[0.75],
+    )
+    # Sample 1 has no directory. Sample 2 has a directory but no trajectory file.
+    (train_dir / "instance-a/2").mkdir(parents=True)
+
+    dapo_path = cpu_main.write_dapo_json(model="model", epoch=0, samples=3)
+
+    assert json.loads(dapo_path.read_text(encoding="utf-8")) == [
+        [[[[10], [[20, 0.75]], 1]], [], []]
+    ]
+    errors = capsys.readouterr().err
+    assert "instance-a/1/instance-a.traj" in errors
+    assert "instance-a/2/instance-a.traj" in errors
+
+
 def test_collection_rejects_missing_token_metadata(tmp_path, monkeypatch):
     sweagent_dir = tmp_path / "sweagent"
     train_dir = sweagent_dir / "logs/model/0/train"
@@ -233,6 +259,7 @@ class _UploadState:
         self.upload_lock = threading.Lock()
         self.ready = False
         self.stop_requested = False
+        self.normal_completion = False
         self.stop_event = threading.Event()
 
     def mark_trajectory_ready(self, epoch: int, _checksum: str) -> None:
@@ -242,8 +269,9 @@ class _UploadState:
     def trajectory_is_ready(self) -> bool:
         return self.ready
 
-    def request_stop(self, _reason: str) -> None:
+    def request_stop(self, _reason: str, *, normal_completion: bool = False) -> None:
         self.stop_requested = True
+        self.normal_completion = normal_completion
         self.stop_event.set()
 
 
@@ -294,7 +322,48 @@ def test_gpu_readiness_ack_default_retry_interval_is_one_minute():
     args, backend_args = gpu_server.parse_args(["--epoch", "0"])
 
     assert args.ack_retry_interval == 60.0
+    assert args.listen_port == 8004
     assert backend_args == []
+
+
+def test_gpu_server_succeeds_only_after_normal_epoch_completion():
+    completed_state = SimpleNamespace(
+        normal_completion=True,
+        process=SimpleNamespace(returncode=-2),
+    )
+    failed_signal_state = SimpleNamespace(
+        normal_completion=False,
+        process=SimpleNamespace(returncode=-2),
+    )
+    failed_clean_exit_state = SimpleNamespace(
+        normal_completion=False,
+        process=SimpleNamespace(returncode=0),
+    )
+    failed_unknown_exit_state = SimpleNamespace(
+        normal_completion=False,
+        process=SimpleNamespace(returncode=None),
+    )
+
+    assert gpu_server.server_exit_code(completed_state) == 0
+    assert gpu_server.server_exit_code(failed_signal_state) == -2
+    assert gpu_server.server_exit_code(failed_clean_exit_state) == 1
+    assert gpu_server.server_exit_code(failed_unknown_exit_state) == 1
+
+
+def test_gpu_server_requires_both_current_upload_and_ack(tmp_path):
+    state = gpu_server.RuntimeState(
+        SimpleNamespace(returncode=0),
+        stop_timeout=1,
+        epoch=3,
+        dapo_path=tmp_path / "dapo.json",
+    )
+
+    with pytest.raises(RuntimeError, match="before its DAPO data is received"):
+        state.request_stop("ACK received", normal_completion=True)
+
+    state.mark_trajectory_ready(epoch=3, checksum="a" * 64)
+    assert not state.normal_completion
+    assert gpu_server.server_exit_code(state) == 1
 
 
 def test_cpu_completion_ack_retries_until_http_200_and_sends_epoch(monkeypatch):
@@ -316,6 +385,59 @@ def test_cpu_completion_ack_retries_until_http_200_and_sends_epoch(monkeypatch):
     )
     assert epochs == ["7", "7"]
     assert cpu_main.DEFAULT_ACK_RETRY_INTERVAL == 60.0
+
+
+def test_dapo_upload_retries_five_times_at_fifteen_second_intervals(
+    tmp_path, monkeypatch
+):
+    attempts = []
+    sleeps = []
+
+    class UploadResponse:
+        reason = "temporary"
+
+        def __init__(self, status):
+            self.status = status
+
+        def read(self, _size):
+            return b"temporary failure" if self.status == 503 else b"received"
+
+    class FlakyConnection:
+        def __init__(self, _host, _port, *, timeout):
+            assert timeout == cpu_main.DEFAULT_TRAJECTORY_UPLOAD_TIMEOUT
+            attempts.append(len(attempts) + 1)
+            self.attempt = attempts[-1]
+
+        def putrequest(self, _method, _path):
+            if self.attempt <= 3:
+                raise OSError("temporary tunnel failure")
+
+        def putheader(self, *_args):
+            pass
+
+        def endheaders(self):
+            pass
+
+        def send(self, _chunk):
+            pass
+
+        def getresponse(self):
+            return UploadResponse(503 if self.attempt == 4 else 201)
+
+        def close(self):
+            pass
+
+    source = tmp_path / "dapo.json"
+    source.write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(cpu_main.http.client, "HTTPConnection", FlakyConnection)
+    monkeypatch.setattr(cpu_main.time, "sleep", sleeps.append)
+
+    cpu_main.upload_dapo_json("http://localhost:9001", source, epoch=3)
+
+    assert cpu_main.DEFAULT_TRAJECTORY_UPLOAD_RETRIES == 5
+    assert cpu_main.DEFAULT_TRAJECTORY_UPLOAD_RETRY_INTERVAL == 15.0
+    assert attempts == [1, 2, 3, 4, 5]
+    assert sleeps == [15.0, 15.0, 15.0, 15.0]
 
 
 def _start_server(handler):
@@ -400,6 +522,7 @@ def test_http_upload_atomically_replaces_dapo_and_gates_ack(tmp_path):
             assert response.status == 200
         assert state.stop_event.wait(timeout=2)
         assert state.stop_requested
+        assert state.normal_completion
     finally:
         upload_server.shutdown()
         ack_server.shutdown()

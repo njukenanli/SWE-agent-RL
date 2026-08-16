@@ -22,7 +22,7 @@ from urllib.request import Request, urlopen
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR.parent / ".env"
 DEFAULT_LISTEN_HOST = "0.0.0.0"
-DEFAULT_LISTEN_PORT = 8003
+DEFAULT_LISTEN_PORT = 8004
 DEFAULT_TRAJECTORY_UPLOAD_HOST = "127.0.0.1"
 DAPO_JSON_PATH = SCRIPT_DIR.parent / "verl" / "dapo.json"
 UPLOAD_CHUNK_SIZE = 1024 * 1024
@@ -569,6 +569,7 @@ class RuntimeState:
         self._upload_lock = threading.Lock()
         self.shutdown_event = threading.Event()
         self._stopping = False
+        self._normal_completion = False
         self._stop_thread: threading.Thread | None = None
         self._ready_epoch: int | None = None
         self._ready_checksum: str | None = None
@@ -577,6 +578,11 @@ class RuntimeState:
     def stopping(self) -> bool:
         with self._lock:
             return self._stopping
+
+    @property
+    def normal_completion(self) -> bool:
+        with self._lock:
+            return self._normal_completion
 
     @property
     def upload_lock(self) -> threading.Lock:
@@ -591,8 +597,16 @@ class RuntimeState:
         with self._lock:
             return self._ready_epoch == self.epoch and self._ready_checksum is not None
 
-    def request_stop(self, reason: str) -> threading.Thread | None:
+    def request_stop(
+        self, reason: str, *, normal_completion: bool = False
+    ) -> threading.Thread | None:
         with self._lock:
+            if normal_completion:
+                if self._ready_epoch != self.epoch or self._ready_checksum is None:
+                    raise RuntimeError(
+                        f"Cannot complete epoch {self.epoch} before its DAPO data is received"
+                    )
+                self._normal_completion = True
             if self._stopping:
                 return self._stop_thread
             self._stopping = True
@@ -691,7 +705,7 @@ def make_ack_handler(state: RuntimeState) -> type[BaseHTTPRequestHandler]:
                 self.send_header("Content-Length", str(len(b"ACK received\n")))
                 self.end_headers()
                 self.wfile.write(b"ACK received\n")
-                state.request_stop("ACK received on listener")
+                state.request_stop("ACK received on listener", normal_completion=True)
                 return
 
             self.send_response(400)
@@ -875,6 +889,18 @@ def monitor_backend(state: RuntimeState) -> None:
     state.shutdown_listener()
 
 
+def server_exit_code(state: RuntimeState) -> int:
+    """Return success only after the current epoch's upload and ACK handshake."""
+    if state.normal_completion:
+        return 0
+
+    # vLLM may return zero after a graceful but unexpected shutdown. That does
+    # not complete this workflow: without the current DAPO upload and CPU ACK,
+    # main.sh must stop instead of training on a stale dapo.json.
+    return_code = state.process.returncode
+    return return_code if return_code not in {None, 0} else 1
+
+
 def main(argv: list[str]) -> int:
     args, backend_args = parse_args(argv)
 
@@ -919,7 +945,7 @@ def main(argv: list[str]) -> int:
             state.wait_for_stop()
             if process.poll() is None:
                 stop_backend(process, args.stop_timeout, "ACK retry loop stopped")
-            return process.returncode if process.returncode is not None else 1
+            return server_exit_code(state)
 
         handler = make_ack_handler(state)
         httpd = ThreadingHTTPServer((args.listen_host, args.listen_port), handler)
@@ -956,7 +982,7 @@ def main(argv: list[str]) -> int:
             stop_backend(process, args.stop_timeout, "Server failed")
         raise
 
-    return process.returncode if process.returncode is not None else 0
+    return server_exit_code(state)
 
 
 if __name__ == "__main__":

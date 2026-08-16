@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Literal
@@ -31,8 +32,13 @@ ACK_PAYLOAD = "ACK"
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_ACK_RETRY_INTERVAL = 60.0
 DEFAULT_TRAJECTORY_UPLOAD_TIMEOUT = 60 * 60
-DEFAULT_TRAJECTORY_UPLOAD_RETRIES = 3
+DEFAULT_TRAJECTORY_UPLOAD_RETRIES = 5
+DEFAULT_TRAJECTORY_UPLOAD_RETRY_INTERVAL = 15.0
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+class _RetryableUploadError(RuntimeError):
+    """A temporary HTTP response that should retry the DAPO upload."""
 
 
 def parse_dotenv(path: Path) -> dict[str, str]:
@@ -402,17 +408,24 @@ def collect_dapo_trajectories(*, model: str, epoch: int, samples: int) -> list[l
     for instance_dir in instance_dirs:
         sample_dirs = [path for path in instance_dir.iterdir() if path.is_dir() and path.name.isdecimal()]
         actual_sample_ids = {int(path.name) for path in sample_dirs}
-        if actual_sample_ids != expected_sample_ids or len(sample_dirs) != samples:
+        unexpected_sample_ids = actual_sample_ids - expected_sample_ids
+        if unexpected_sample_ids:
             raise ValueError(
-                f"{instance_dir}: expected sample directories 0..{samples - 1}, "
-                f"found {sorted(actual_sample_ids)}"
+                f"{instance_dir}: found unexpected sample directories "
+                f"{sorted(unexpected_sample_ids)}; expected IDs 0..{samples - 1}"
             )
 
         group: list[list[list[object]]] = []
         for sample_id in range(samples):
             trajectory_path = instance_dir / str(sample_id) / f"{instance_dir.name}.traj"
             if not trajectory_path.is_file():
-                raise FileNotFoundError(f"Missing trajectory: {trajectory_path}")
+                print(
+                    f"Missing sample trajectory {trajectory_path}; inserting an empty reward-0 placeholder",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                group.append([])
+                continue
             group.append(_convert_trajectory(trajectory_path))
         groups.append(group)
     return groups
@@ -458,6 +471,7 @@ def upload_dapo_json(
     epoch: int,
     timeout: float = DEFAULT_TRAJECTORY_UPLOAD_TIMEOUT,
     retries: int = DEFAULT_TRAJECTORY_UPLOAD_RETRIES,
+    retry_interval: float = DEFAULT_TRAJECTORY_UPLOAD_RETRY_INTERVAL,
 ) -> None:
     parsed = urlparse(upload_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -466,6 +480,8 @@ def upload_dapo_json(
         raise ValueError("TRAJECTORY_UPLOAD_URL must not contain credentials or a fragment")
     if timeout <= 0:
         raise ValueError("trajectory upload timeout must be positive")
+    if retry_interval < 0:
+        raise ValueError("trajectory upload retry interval must be non-negative")
 
     request_path = parsed.path if parsed.path not in {"", "/"} else "/dapo"
     if parsed.query:
@@ -498,19 +514,22 @@ def upload_dapo_json(
                     flush=True,
                 )
                 return
-            raise RuntimeError(
-                f"trajectory upload returned HTTP {response.status}: {response_body or response.reason}"
-            )
-        except (http.client.HTTPException, OSError) as exc:
+            message = f"trajectory upload returned HTTP {response.status}: {response_body or response.reason}"
+            if response.status in {408, 425, 429} or 500 <= response.status < 600:
+                raise _RetryableUploadError(message)
+            raise RuntimeError(message)
+        except (http.client.HTTPException, OSError, _RetryableUploadError) as exc:
             if attempt >= retries:
                 raise RuntimeError(
                     f"Failed to upload epoch {epoch} DAPO data after {retries} attempt(s): {exc}"
                 ) from exc
             print(
-                f"Trajectory upload attempt {attempt}/{retries} failed: {exc}; retrying",
+                f"Trajectory upload attempt {attempt}/{retries} failed: {exc}; "
+                f"retrying in {retry_interval:g} seconds",
                 file=sys.stderr,
                 flush=True,
             )
+            time.sleep(retry_interval)
         finally:
             connection.close()
 

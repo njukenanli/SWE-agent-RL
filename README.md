@@ -77,9 +77,29 @@ cd /workspace/gpu
 
 ## Run
 
+### Link the two machines through ssh tunnel
+
+As specified in gpu/.env and cpu/.env:
+The CPU ACK server listens on port `8003`, and the GPU ACK server listens on port
+`8004`. Port `5001` forwards vLLM API. Port `9001` forwards trajectory uploads from the CPU
+machine to the GPU machine.
+
+The ssh tunnel configurations are set in `cpu/tunnel.sh`. Modify `cpu/tunnel.sh` to adapt to your GPU machine ssh login configurations.
+If the SSH connection is interrupted, the script retries indefinitely after a 10-second delay.
+Set `SSH_TUNNEL_RETRY_DELAY_SECONDS` to use a different delay.
+
+To start the ssh tunnel connection, from CPU machine, start a tmux session.
+Inside the session, run:
+
+```bash
+bash cpu/tunnel.sh
+```
+
 ### On CPU side
 
 ```bash
+cd cpu
+
 python main.py \
   --num_workers 1 \
   --train_set train.jsonl \
@@ -93,6 +113,14 @@ The sweagent side waits until GPU side is ready (receives ACK from GPU side) and
 epoch. The selection advances through `--train_set` by epoch and wraps at the end.
 The selected instances overwrite `cpu/sweagent/temp.jsonl`, which is used only
 for training rollouts. Test rollouts use the complete `--test_set` in every epoch.
+GPU training consumes every task group in the uploaded `dapo.json`, so the
+number of DAPO groups automatically matches the epoch's training batch size.
+The GPU also derives the trajectories-per-group value from the uploaded JSON,
+so it follows the CPU training configuration without a fixed sample count.
+If an expected CPU sample directory or trajectory file is missing, the CPU
+inserts `[]`; the GPU treats it as reward 0 with no trainable tokens.
+DAPO uploads use up to five attempts, waiting 15 seconds between retryable
+transport or temporary HTTP failures.
 Keep the training batch smaller than the full dataset so each epoch performs
 one RL mini_batch=full_batch=one weight-update step -- this is necessary for agentic RL.
 
@@ -101,7 +129,9 @@ one RL mini_batch=full_batch=one weight-update step -- this is necessary for age
 In side the container specified above:
 
 ```bash
+cd gpu
+
 bash main.sh --epoch 120 --data-dir /Data
 ```
 
-The code starts vllm, until CPU side sends ACK -- rollout ends and rsync trajs to GPU. Then it starts verl training. When training ends the vllm is started again from the updated LM weights.
+The code starts vllm, until CPU side sends ACK -- rollout ends and the cpu side uploads trajs to the gpu side. Then it starts verl training. When training ends the vllm is started again from the updated LM weights.
