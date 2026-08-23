@@ -5,24 +5,39 @@ View [docs/demo.pdf](./docs/demo.pdf) for detailed algorithm explanation.
 
 ## Workflow
 
+Each epoch alternates between trajectory collection on the CPU machine and
+policy optimization on the GPU machine:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GPU as GPU machine: vLLM + VERL
+    participant CPU as CPU machine: SWE-agent + SWE-bench-eval
+
+    loop Every epoch N
+        GPU->>GPU: vLLM serves the base model (N=0) or epoch N-1 checkpoint
+        GPU->>CPU: Send readiness ACK for epoch N
+
+        CPU->>GPU: Run the complete test split (temperature 0)
+        CPU->>CPU: Evaluate test patches and report success rate
+
+        CPU->>GPU: Run the selected training batch (temperature 1)
+        CPU->>CPU: Evaluate training patches and report success rate
+
+        CPU->>GPU: Upload training trajectories and rewards
+        CPU->>GPU: Send epoch-completion ACK
+
+        GPU->>GPU: Stop vLLM after receiving both upload and ACK
+        GPU->>GPU: Run RL (DAPO alg.) and export the epoch N checkpoint
+    end
 ```
-GPU side:
-    vllm serves base model
-    gpu side sends ACK to cpu side
-CPU side:
-    cpu side receives ACK from gpu side
-    sweagent run test set with no sampling
-    run swebench eval and report success rate on test set
-    sweagent run training set with batch_size(=64) and num_samples(=8)
-    run swebench eval and report success rate on training set
-    send trajectories of training set with I/O token ids and output probabilities, and eval result to GPU side
-GPU side:
-    run RL (dapo) on received trajectories with rewards of success state
-    vllm serves the updated model
-    gpu side sends ACK to cpu side
-CPU side:
-    loop with the same procedure ...
-```
+
+Every uploaded trajectory contains the per-round input token IDs, generated
+token IDs, generated-token probabilities, and final evaluation result. RL
+groups all samples from the same task, computes one normalized advantage per
+trajectory, and applies that advantage to every generated token in the
+trajectory. The newly exported checkpoint becomes the model served in the next
+epoch.
 
 ## Environment setup
 
@@ -51,6 +66,7 @@ The GPU workflow targets one x86-64 machine with 8 NVIDIA B200 GPUs.
 ```bash
 docker pull verlai/verl:vllm017.latest
 
+# you'd better run it inside a tmux session.
 docker run --rm -it \
   --gpus all \
   --net=host \
