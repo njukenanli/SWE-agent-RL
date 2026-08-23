@@ -36,8 +36,9 @@ OpenAI-compatible endpoint:
   top_logprobs: 1
   prompt_logprobs: 1
 
-Temperature is active. All other sampling filters and penalties are explicitly
-set to their neutral values.
+The server temperature is only a fallback. A temperature supplied in an API
+request takes precedence. Middleware forcefully sets all other sampling
+filters and penalties to their neutral values.
 
 Qwen3.5 reasoning and automatic tool calling are enabled with the qwen3 and
 qwen3_coder parsers.
@@ -108,6 +109,9 @@ if [[ -z "$SERVED_MODEL_NAME" ]]; then
   SERVED_MODEL_NAME="$MODEL"
 fi
 
+# vLLM consults this server generation config only for sampling fields omitted
+# by a request. SWE-agent sends temperature on every request, so test.yaml's
+# 0.0 and train.yaml's 1.0 take precedence over this fallback.
 GENERATION_CONFIG='{"temperature":1.0,"top_p":1.0,"top_k":0,"min_p":0.0,"presence_penalty":0.0,"frequency_penalty":0.0,"repetition_penalty":1.0}'
 
 if [[ -n "${VLLM_BIN:-}" ]]; then

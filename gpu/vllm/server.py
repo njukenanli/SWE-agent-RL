@@ -33,10 +33,18 @@ TOKEN_DETAILS_ENDPOINTS = {
     "/v1/chat/completions",
     "/v1/chat/completions/batch",
 }
+NEUTRAL_SAMPLING_PARAMS = {
+    "top_p": 1.0,
+    "top_k": 0,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "repetition_penalty": 1.0,
+}
 
 
 class TokenDetailsDefaultsMiddleware:
-    """Inject token IDs and output logprobs into vLLM generation requests."""
+    """Inject token metadata and allow only temperature-based sampling."""
 
     def __init__(self, app: object) -> None:
         self.app = app
@@ -101,6 +109,10 @@ class TokenDetailsDefaultsMiddleware:
             )
             return
 
+        # Preserve request temperature: vLLM gives it precedence over server
+        # generation defaults. Force every other sampling filter and penalty
+        # to its neutral value so temperature is the only active control.
+        payload.update(NEUTRAL_SAMPLING_PARAMS)
         # This service's consumers require aligned token IDs and probabilities,
         # so do not allow request defaults to disable the response metadata.
         payload["return_token_ids"] = True

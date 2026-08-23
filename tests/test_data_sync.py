@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import queue
@@ -28,8 +29,66 @@ cpu_main = _load_module("rl_cpu_main", ROOT / "cpu/main.py")
 gpu_server = _load_module("rl_gpu_server", ROOT / "gpu/vllm/server.py")
 
 
+def _run_token_details_middleware(payload):
+    captured_payloads = []
+
+    async def downstream(_scope, receive, _send):
+        message = await receive()
+        captured_payloads.append(json.loads(message["body"]))
+
+    middleware = gpu_server.TokenDetailsDefaultsMiddleware(downstream)
+    request_messages = iter(
+        [{"type": "http.request", "body": json.dumps(payload).encode(), "more_body": False}]
+    )
+
+    async def receive():
+        return next(request_messages)
+
+    async def send(_message):
+        return None
+
+    asyncio.run(
+        middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/chat/completions",
+                "headers": [(b"content-type", b"application/json")],
+            },
+            receive,
+            send,
+        )
+    )
+    return captured_payloads[0]
+
+
 def test_default_epoch_dataset_batch_path_is_inside_sweagent():
     assert cpu_main.TEMP_DATASET_PATH == ROOT / "cpu/sweagent/temp.jsonl"
+
+
+@pytest.mark.parametrize("temperature", [0.0, 1.0])
+def test_gpu_token_details_middleware_preserves_request_temperature(temperature):
+    payload = _run_token_details_middleware(
+        {
+            "model": "my-qwen-model",
+            "messages": [{"role": "user", "content": "test"}],
+            "temperature": temperature,
+            "top_p": 0.25,
+            "top_k": 10,
+            "min_p": 0.1,
+            "presence_penalty": 0.5,
+            "frequency_penalty": 0.5,
+            "repetition_penalty": 1.2,
+        }
+    )
+
+    assert payload["temperature"] == temperature
+    assert {
+        key: payload[key] for key in gpu_server.NEUTRAL_SAMPLING_PARAMS
+    } == gpu_server.NEUTRAL_SAMPLING_PARAMS
+    assert payload["return_token_ids"] is True
+    assert payload["logprobs"] is True
+    assert payload["top_logprobs"] == 1
 
 
 def test_cpu_cli_and_sweagent_command_use_num_workers(tmp_path, monkeypatch):
