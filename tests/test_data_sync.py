@@ -4,6 +4,8 @@ import asyncio
 import importlib.util
 import json
 import queue
+import shlex
+import subprocess
 import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -139,6 +141,21 @@ def test_gpu_token_details_middleware_waits_for_real_disconnect():
 
     assert received_messages[0]["type"] == "http.request"
     assert received_messages[1] == {"type": "http.disconnect"}
+
+
+def test_vllm_launch_enables_long_context_qwen_prefix_cache():
+    result = subprocess.run(
+        ["bash", str(ROOT / "gpu/vllm/vllm.sh"), "--dry-run"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    command = shlex.split(result.stdout)
+
+    assert "--enable-prefix-caching" in command
+    assert command[command.index("--mamba-cache-mode") + 1] == "align"
+    max_model_len = int(command[command.index("--max-model-len") + 1])
+    assert max_model_len > 60_000
 
 
 def test_cpu_cli_and_sweagent_command_use_num_workers(tmp_path, monkeypatch):
@@ -405,6 +422,38 @@ def test_collection_rejects_missing_token_metadata(tmp_path, monkeypatch):
         cpu_main.write_dapo_json(model="model", epoch=0, samples=1)
 
     assert not (train_dir / "dapo.json").exists()
+
+
+def test_collection_skips_terminal_step_without_token_metadata(tmp_path, monkeypatch):
+    sweagent_dir = tmp_path / "sweagent"
+    train_dir = sweagent_dir / "logs/model/0/train"
+    monkeypatch.setattr(cpu_main, "SWEAGENT_DIR", sweagent_dir)
+    _write_trajectory(
+        train_dir,
+        "instance-a",
+        0,
+        success=False,
+        input_ids=[10],
+        output_ids=[20],
+        probabilities=[0.75],
+    )
+    trajectory_path = train_dir / "instance-a/0/instance-a.traj"
+    trajectory_data = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    trajectory_data["trajectory"].append(
+        {
+            "response": "Exit due to cost limit",
+            "input_token_ids": None,
+            "output_token_ids": None,
+            "output_token_probabilities": None,
+        }
+    )
+    trajectory_path.write_text(json.dumps(trajectory_data), encoding="utf-8")
+
+    dapo_path = cpu_main.write_dapo_json(model="model", epoch=0, samples=1)
+
+    assert json.loads(dapo_path.read_text(encoding="utf-8")) == [
+        [[[[10], [[20, 0.75]], 0]]]
+    ]
 
 
 class _UploadState:

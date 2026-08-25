@@ -8,6 +8,7 @@ SERVED_MODEL_NAME="my-qwen-model"
 API_KEY="dummy"
 MAX_LOGPROBS="1"
 LOGPROBS_MODE="processed_logprobs"
+MAX_MODEL_LEN="262144"
 DRY_RUN=0
 EXTRA_ARGS=()
 
@@ -39,6 +40,10 @@ OpenAI-compatible endpoint:
 The server temperature is only a fallback. A temperature supplied in an API
 request takes precedence. Middleware forcefully sets all other sampling
 filters and penalties to their neutral values.
+
+Automatic prefix caching is enabled in Qwen3.5's supported Mamba "align"
+mode. The 262,144-token model context accommodates SWE-agent trajectories
+whose prompts grow beyond 50,000-60,000 tokens.
 
 Qwen3.5 reasoning and automatic tool calling are enabled with the qwen3 and
 qwen3_coder parsers.
@@ -131,6 +136,9 @@ CMD=(
   --port "$PORT"
   --generation-config vllm
   --override-generation-config "$GENERATION_CONFIG"
+  --max-model-len "$MAX_MODEL_LEN"
+  --enable-prefix-caching
+  --mamba-cache-mode align
   --max-logprobs "$MAX_LOGPROBS"
   --logprobs-mode "$LOGPROBS_MODE"
   --reasoning-parser qwen3
