@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Awaitable, Callable
 import hashlib
 import hmac
 import json
@@ -52,7 +53,7 @@ class TokenDetailsDefaultsMiddleware:
     async def __call__(
         self,
         scope: dict[str, object],
-        receive: object,
+        receive: Callable[[], Awaitable[dict[str, object]]],
         send: object,
     ) -> None:
         path = str(scope.get("path", "")).rstrip("/")
@@ -80,7 +81,11 @@ class TokenDetailsDefaultsMiddleware:
         while True:
             message = await receive()
             if message["type"] != "http.request":
-                await self.app(scope, _single_message_receiver(message), send)
+                await self.app(
+                    scope,
+                    _single_message_receiver(message, receive),
+                    send,
+                )
                 return
             body_parts.append(message.get("body", b""))
             if not message.get("more_body", False):
@@ -93,7 +98,8 @@ class TokenDetailsDefaultsMiddleware:
             await self.app(
                 scope,
                 _single_message_receiver(
-                    {"type": "http.request", "body": original_body}
+                    {"type": "http.request", "body": original_body},
+                    receive,
                 ),
                 send,
             )
@@ -103,7 +109,8 @@ class TokenDetailsDefaultsMiddleware:
             await self.app(
                 scope,
                 _single_message_receiver(
-                    {"type": "http.request", "body": original_body}
+                    {"type": "http.request", "body": original_body},
+                    receive,
                 ),
                 send,
             )
@@ -139,21 +146,25 @@ class TokenDetailsDefaultsMiddleware:
         await self.app(
             modified_scope,
             _single_message_receiver(
-                {"type": "http.request", "body": modified_body}
+                {"type": "http.request", "body": modified_body},
+                receive,
             ),
             send,
         )
 
 
-def _single_message_receiver(message: dict[str, object]) -> object:
+def _single_message_receiver(
+    message: dict[str, object],
+    receive_next: Callable[[], Awaitable[dict[str, object]]],
+) -> Callable[[], Awaitable[dict[str, object]]]:
     sent = False
 
     async def receive() -> dict[str, object]:
         nonlocal sent
-        if sent:
-            return {"type": "http.disconnect"}
-        sent = True
-        return message
+        if not sent:
+            sent = True
+            return message
+        return await receive_next()
 
     return receive
 

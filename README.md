@@ -52,6 +52,10 @@ The CPU machine must be a physical machine or AWS VM that allows running docker 
 Minimun cpu machine requirements: 64 cpus, 500GB RAM, 8TB storage.
 
 ```bash
+git clone https://github.com/njukenanli/SWE-agent-RL --recursive
+cd SWE-agent-RL
+git submodule update --init --recursive
+
 cd cpu
 python -m venv venv
 source venv/bin/activate
@@ -63,10 +67,21 @@ python -m pip install --upgrade pip && pip install --editable .
 
 The GPU workflow targets one x86-64 machine with 8 NVIDIA B200 GPUs. 
 
+You can use a containerized pod with `verlai/verl:vllm017.latest` as the base image. 
+You can also use a GPU virtual machine and install docker and NVIDIA Container Toolkit yourself.
+
 ```bash
+mkdir -p $HOME/Data # choose the dir to store model weights yourself.
+
+git clone https://github.com/njukenanli/SWE-agent-RL --recursive
+cd SWE-agent-RL
+git submodule update --init --recursive
+
 docker pull verlai/verl:vllm017.latest
 
 # you'd better run it inside a tmux session.
+tmux new -s exp
+
 docker run --rm -it \
   --gpus all \
   --net=host \
@@ -77,6 +92,7 @@ docker run --rm -it \
   --cap-add=SYS_ADMIN \
   -v "$PWD/gpu:/workspace/gpu" \
   -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  -v "$HOME/Data:/Data" \
   -w /workspace/gpu \
   --name verl-rft-rl \
   verlai/verl:vllm017.latest \
@@ -136,6 +152,12 @@ Inside the session, run:
 bash cpu/tunnel.sh
 ```
 
+Then run outside the tmux session:
+```bash
+lsof -i :9001
+```
+to verify the tunnel is alive.
+
 ### On CPU side
 
 First, modify training and test configs in `cpu/sweagent/config/train.yaml` and `cpu/sweagent/config/test.yaml` to control SWE-agent behavior.
@@ -173,7 +195,8 @@ one RL mini_batch=full_batch=one weight-update step -- this is necessary for age
 In side the container specified above:
 
 ```bash
-cd gpu
+# inside the tmux session, inside the container you've just started.
+cd /workspace/gpu
 
 bash main.sh \
   --epoch 120 \

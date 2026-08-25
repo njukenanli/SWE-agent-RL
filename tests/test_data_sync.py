@@ -91,6 +91,56 @@ def test_gpu_token_details_middleware_preserves_request_temperature(temperature)
     assert payload["top_logprobs"] == 1
 
 
+def test_gpu_token_details_middleware_waits_for_real_disconnect():
+    request_messages = asyncio.Queue()
+    request_messages.put_nowait(
+        {
+            "type": "http.request",
+            "body": json.dumps(
+                {
+                    "model": "my-qwen-model",
+                    "messages": [{"role": "user", "content": "test"}],
+                }
+            ).encode(),
+            "more_body": False,
+        }
+    )
+    received_messages = []
+
+    async def receive():
+        return await request_messages.get()
+
+    async def downstream(_scope, replay_receive, _send):
+        received_messages.append(await replay_receive())
+        disconnect_task = asyncio.create_task(replay_receive())
+        await asyncio.sleep(0)
+        assert not disconnect_task.done()
+
+        request_messages.put_nowait({"type": "http.disconnect"})
+        received_messages.append(await asyncio.wait_for(disconnect_task, timeout=1))
+
+    async def send(_message):
+        return None
+
+    async def run_middleware():
+        middleware = gpu_server.TokenDetailsDefaultsMiddleware(downstream)
+        await middleware(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/chat/completions",
+                "headers": [(b"content-type", b"application/json")],
+            },
+            receive,
+            send,
+        )
+
+    asyncio.run(run_middleware())
+
+    assert received_messages[0]["type"] == "http.request"
+    assert received_messages[1] == {"type": "http.disconnect"}
+
+
 def test_cpu_cli_and_sweagent_command_use_num_workers(tmp_path, monkeypatch):
     train_set = tmp_path / "train.jsonl"
     test_set = tmp_path / "test.jsonl"
