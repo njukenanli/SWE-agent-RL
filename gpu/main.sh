@@ -78,6 +78,24 @@ DATA_DIR="$(cd "$DATA_DIR" && pwd)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+detect_num_gpus() {
+  local count
+
+  if ! count="$(python -c 'import torch; print(torch.cuda.device_count())')"; then
+    echo "Failed to detect visible CUDA GPUs with PyTorch" >&2
+    return 1
+  fi
+  if ! [[ "$count" =~ ^[0-9]+$ ]] || [[ "$count" -lt 1 ]]; then
+    echo "Expected at least one visible CUDA GPU, detected: $count" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$count"
+}
+
+NUM_GPUS="$(detect_num_gpus)"
+echo "Detected $NUM_GPUS visible CUDA GPU(s); DAPO will use $NUM_GPUS process(es)."
+
 validate_hf_model() {
   local model_dir="$1"
   local weights=()
@@ -139,7 +157,7 @@ for ((epoch = START_EPOCH; epoch < EPOCH; epoch++)); do
       --model-path "$MODEL_PATH" \
       --save-path "$CHECKPOINT_PATH" \
       --num-groups 0 \
-      --nproc 8 \
+      --nproc "$NUM_GPUS" \
       --tp 1 \
       --pp 1 \
       --cp 1 \

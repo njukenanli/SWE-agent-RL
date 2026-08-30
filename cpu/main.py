@@ -26,7 +26,6 @@ from ruamel.yaml import YAML
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR / ".env"
 SWEAGENT_DIR = SCRIPT_DIR / "sweagent"
-LOG_PATH = SCRIPT_DIR / "log.out"
 TEMP_DATASET_PATH = SWEAGENT_DIR / "temp.jsonl"
 ACK_PAYLOAD = "ACK"
 DEFAULT_HOST = "0.0.0.0"
@@ -587,9 +586,10 @@ def run_sweagent(
         ("train", Path("config/train.yaml"), train_dataset),
     ]
 
-    with LOG_PATH.open("a", encoding="utf-8") as log_file:
-        for mode, config_path, mode_dataset in jobs:
-            model = _get_model_name(SWEAGENT_DIR / config_path)
+    for mode, config_path, mode_dataset in jobs:
+        model = _get_model_name(SWEAGENT_DIR / config_path)
+        log_path = SCRIPT_DIR / model / "sweagent_exec_log.out"
+        with log_path.open("a", encoding="utf-8") as log_file:
             command = [
                 "sweagent",
                 "run-batch",
@@ -600,7 +600,7 @@ def run_sweagent(
                 str(mode_dataset),
             ]
             print(
-                f"Running {' '.join(command)}; output redirected to {LOG_PATH}",
+                f"Running {' '.join(command)}; output redirected to {log_path}",
                 flush=True,
             )
             subprocess.run(
