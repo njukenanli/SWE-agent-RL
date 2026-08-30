@@ -105,6 +105,7 @@ training and serving dependencies:
 ```bash
 cd /workspace/gpu/verl
 pip install --no-deps -e .
+pip install --no-deps fla-core==0.5.2 flash-linear-attention==0.5.2
 
 python - <<'PY'
 import torch
@@ -203,7 +204,8 @@ cd /workspace/gpu
 bash main.sh \
   --epoch 120 \
   --data-dir /Data \
-  --start_epoch 0
+  --start_epoch 0 \
+  --context-parallel 2
 ```
 
 The code starts vllm, until CPU side sends ACK -- rollout ends and the cpu side uploads trajs to the gpu side. Then it starts verl training. When training ends the vllm is started again from the updated LM weights.
@@ -215,3 +217,8 @@ and loads `/Data/model/epoch_36` for the first resumed rollout instead of the
 base model. The previous model and checkpoint directories must remain under
 the same `--data-dir`. The CPU uses epoch 37 for its dataset selection, output
 directories, trajectory upload, and ACK handshake.
+
+`--context-parallel` controls how many GPUs share each long DAPO sequence and
+defaults to `1`. On an 8-GPU H100 machine, `--context-parallel 2` produces four
+data-parallel groups and splits each sequence across two GPUs. If CUDA OOM, try
+to increase this value.

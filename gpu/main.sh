@@ -5,17 +5,19 @@ EPOCH=""
 START_EPOCH="0"
 DATA_DIR=""
 INITIAL_MODEL="Qwen/Qwen3.5-4B"
+CONTEXT_PARALLEL="1"
 
 usage() {
   cat <<'USAGE'
 Usage:
-  bash main.sh --epoch N --data-dir PATH [--start_epoch N]
+  bash main.sh --epoch N --data-dir PATH [--start_epoch N] [--context-parallel N]
 
 Options:
-  --epoch N          Total target epoch count; the final epoch is N-1.
-  --start_epoch N    First zero-based epoch to run. Default: 0.
-  --data-dir PATH    Root directory for model/epoch_N HF models and checkpoints.
-  -h, --help         Show this help.
+  --epoch N             Total target epoch count; the final epoch is N-1.
+  --start_epoch N       First zero-based epoch to run. Default: 0.
+  --data-dir PATH       Root directory for model/epoch_N HF models and checkpoints.
+  --context-parallel N  Context-parallel GPU count for DAPO. Default: 1.
+  -h, --help            Show this help.
 USAGE
 }
 
@@ -31,6 +33,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --data-dir)
       DATA_DIR="${2:?missing value for --data-dir}"
+      shift 2
+      ;;
+    --context-parallel)
+      CONTEXT_PARALLEL="${2:?missing value for --context-parallel}"
       shift 2
       ;;
     -h|--help)
@@ -72,6 +78,11 @@ if [[ "$START_EPOCH" -ge "$EPOCH" ]]; then
   exit 2
 fi
 
+if ! [[ "$CONTEXT_PARALLEL" =~ ^[0-9]+$ ]] || [[ "$CONTEXT_PARALLEL" -lt 1 ]]; then
+  echo "--context-parallel must be a positive integer, got: $CONTEXT_PARALLEL" >&2
+  exit 2
+fi
+
 mkdir -p "$DATA_DIR/model" "$DATA_DIR/checkpoints"
 DATA_DIR="$(cd "$DATA_DIR" && pwd)"
 
@@ -94,7 +105,11 @@ detect_num_gpus() {
 }
 
 NUM_GPUS="$(detect_num_gpus)"
-echo "Detected $NUM_GPUS visible CUDA GPU(s); DAPO will use $NUM_GPUS process(es)."
+if (( NUM_GPUS % CONTEXT_PARALLEL != 0 )); then
+  echo "Detected GPU count ($NUM_GPUS) must be divisible by --context-parallel ($CONTEXT_PARALLEL)" >&2
+  exit 2
+fi
+echo "Detected $NUM_GPUS visible CUDA GPU(s); DAPO will use $NUM_GPUS process(es) with context parallelism $CONTEXT_PARALLEL."
 
 validate_hf_model() {
   local model_dir="$1"
@@ -160,7 +175,7 @@ for ((epoch = START_EPOCH; epoch < EPOCH; epoch++)); do
       --nproc "$NUM_GPUS" \
       --tp 1 \
       --pp 1 \
-      --cp 1 \
+      --cp "$CONTEXT_PARALLEL" \
       --micro-batch-size-per-gpu 1 \
       --max-input-length 60000 \
       --max-total-length 60000 \
