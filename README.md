@@ -68,7 +68,7 @@ python -m pip install --upgrade pip && pip install --editable .
 The GPU workflow targets one x86-64 machine with 8 NVIDIA B200 GPUs. 
 
 You can use a containerized pod with `verlai/verl:vllm024.dev2` as the base image.
-You can also use a GPU virtual machine and install docker and NVIDIA Container Toolkit yourself.
+You can also use a standalone GPU virtual machine and install docker and NVIDIA Container Toolkit yourself (refer to [install-nvidia-container-toolkit.md](docs/install-nvidia-container-toolkit.md)).
 
 ```bash
 mkdir -p $HOME/Data # choose the dir to store model weights yourself.
