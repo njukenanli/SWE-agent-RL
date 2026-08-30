@@ -588,7 +588,8 @@ def run_sweagent(
 
     for mode, config_path, mode_dataset in jobs:
         model = _get_model_name(SWEAGENT_DIR / config_path)
-        log_path = SCRIPT_DIR / model / "sweagent_exec_log.out"
+        os.makedirs(SWEAGENT_DIR / "logs" / model, exist_ok = True)
+        log_path = SWEAGENT_DIR / "logs" / model / "sweagent_exec_log.out"
         with log_path.open("a", encoding="utf-8") as log_file:
             command = [
                 "sweagent",

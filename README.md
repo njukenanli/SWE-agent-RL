@@ -67,7 +67,7 @@ python -m pip install --upgrade pip && pip install --editable .
 
 The GPU workflow targets one x86-64 machine with 8 NVIDIA B200 GPUs. 
 
-You can use a containerized pod with `verlai/verl:vllm017.latest` as the base image. 
+You can use a containerized pod with `verlai/verl:vllm024.latest` as the base image.
 You can also use a GPU virtual machine and install docker and NVIDIA Container Toolkit yourself.
 
 ```bash
@@ -77,7 +77,7 @@ git clone https://github.com/njukenanli/SWE-agent-RL --recursive
 cd SWE-agent-RL
 git submodule update --init --recursive
 
-docker pull verlai/verl:vllm017.latest
+docker pull verlai/verl:vllm024.latest
 
 # you'd better run it inside a tmux session.
 tmux new -s exp
@@ -95,7 +95,7 @@ docker run --rm -it \
   -v "$HOME/Data:/Data" \
   -w /workspace/gpu \
   --name verl-rft-rl \
-  verlai/verl:vllm017.latest \
+  verlai/verl:vllm024.latest \
   bash
 ```
 
@@ -112,10 +112,12 @@ import pandas
 import pyarrow
 import megatron.core
 import transformer_engine
+import transformers
 import vllm
 
 print("cuda:", torch.version.cuda)
 print("gpus:", torch.cuda.device_count())
+print("transformers:", transformers.__version__)
 print("vllm:", vllm.__version__)
 PY
 

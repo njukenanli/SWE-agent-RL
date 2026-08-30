@@ -19,6 +19,9 @@ def _write_fake_python(fake_bin: Path) -> None:
         "  printf '%s\\n' \"${FAKE_CUDA_DEVICE_COUNT:-1}\"\n"
         "  exit 0\n"
         "fi\n"
+        "if [[ \"$1\" == \"-\" ]]; then\n"
+        "  exit \"${FAKE_DEPENDENCY_CHECK_EXIT:-0}\"\n"
+        "fi\n"
         "printf '%s\\n' \"$*\" > \"$CAPTURE_PATH\"\n"
         "exit 23\n",
         encoding="utf-8",
@@ -93,6 +96,9 @@ def test_gpu_main_uses_visible_gpu_count_for_dapo_nproc(tmp_path, gpu_count):
         "  printf '%s\\n' \"$FAKE_CUDA_DEVICE_COUNT\"\n"
         "  exit 0\n"
         "fi\n"
+        "if [[ \"$1\" == \"-\" ]]; then\n"
+        "  exit 0\n"
+        "fi\n"
         "if [[ \"$1\" == \"vllm/server.py\" ]]; then\n"
         "  exit 0\n"
         "fi\n"
@@ -156,6 +162,35 @@ def test_gpu_main_rejects_no_visible_gpus(tmp_path):
     assert result.returncode == 1
     assert "Expected at least one visible CUDA GPU, detected: 0" in result.stderr
     assert not (tmp_path / "python-args.txt").exists()
+
+
+def test_gpu_main_stops_when_dependency_validation_fails(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_python(fake_bin)
+
+    capture_path = tmp_path / "python-args.txt"
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["CAPTURE_PATH"] = str(capture_path)
+    env["FAKE_DEPENDENCY_CHECK_EXIT"] = "7"
+    result = subprocess.run(
+        [
+            "bash",
+            str(GPU_MAIN),
+            "--epoch",
+            "1",
+            "--data-dir",
+            str(tmp_path / "data"),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 7
+    assert not capture_path.exists()
 
 
 def test_gpu_main_rejects_start_epoch_at_or_after_target(tmp_path):
