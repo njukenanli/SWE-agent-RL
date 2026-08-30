@@ -57,3 +57,5 @@ def test_qwen35_dapo_uses_bshd_without_dynamic_batching(tmp_path):
     assert "model.use_remove_padding=False" in command
     assert "model.use_remove_padding=True" not in command
     assert "data.use_dynamic_bsz=False" in command
+    assert "engine.vanilla_mbridge=True" in command
+    assert "engine.vanilla_mbridge=False" not in command
