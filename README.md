@@ -180,7 +180,7 @@ python main.py \
 
 The sweagent side waits until GPU side is ready (receives ACK from GPU side) and start rollout.
 
-`--workers` usually one 80GB GPU accpets 4 workers.
+`--workers` usually one 80GB GPU accpets 4 agent workers.
 `--batch_size` is the number of training task instances rolled out in each
 epoch. The selection advances through `--train_set` by epoch and wraps at the end.
 The selected instances overwrite `cpu/sweagent/temp.jsonl`, which is used only
