@@ -68,6 +68,7 @@ python -m pip install --upgrade pip && pip install --editable .
 The GPU workflow targets one x86-64 machine with 8 NVIDIA B200 GPUs. 
 
 You can use a containerized pod with `verlai/verl:vllm024.dev2` as the base image.
+
 You can also use a standalone GPU virtual machine and install docker and NVIDIA Container Toolkit yourself (refer to [install-nvidia-container-toolkit.md](docs/install-nvidia-container-toolkit.md)).
 
 ```bash
@@ -79,8 +80,9 @@ git submodule update --init --recursive
 
 docker pull verlai/verl:vllm024.dev2
 
-# you'd better run it inside a tmux session.
+# You'd better run it inside a tmux session because the execution takes a very long time.
 tmux new -s exp
+# Later when you want to enter the tmux session again, enter `tmux attach -t exp`
 
 docker run --rm -it \
   --gpus all \
@@ -169,7 +171,7 @@ First, modify training and test configs in `cpu/sweagent/config/train.yaml` and 
 cd cpu
 
 python main.py \
-  --num_workers 1 \
+  --num_workers 4 \
   --train_set sweagent/datasets/verified-431.jsonl \
   --test_set sweagent/datasets/verified-50.jsonl \
   --batch_size 64 \
@@ -178,6 +180,7 @@ python main.py \
 
 The sweagent side waits until GPU side is ready (receives ACK from GPU side) and start rollout.
 
+`--workers` usually one 80GB GPU accpets 4 workers.
 `--batch_size` is the number of training task instances rolled out in each
 epoch. The selection advances through `--train_set` by epoch and wraps at the end.
 The selected instances overwrite `cpu/sweagent/temp.jsonl`, which is used only
@@ -218,7 +221,7 @@ base model. The previous model and checkpoint directories must remain under
 the same `--data-dir`. The CPU uses epoch 37 for its dataset selection, output
 directories, trajectory upload, and ACK handshake.
 
-`--context-parallel` controls how many GPUs share each long DAPO sequence and
+`--context-parallel` controls how many GPUs share each long agent trajectory and
 defaults to `1`. On an 8-GPU H100 machine, `--context-parallel 2` produces four
-data-parallel groups and splits each sequence across two GPUs. If CUDA OOM, try
+data-parallel groups and splits each trajectory across two GPUs. If CUDA OOM, try
 to increase this value.

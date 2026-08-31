@@ -80,7 +80,56 @@ def test_gpu_main_starts_with_expected_model(
         assert command[2].endswith(expected_model)
     else:
         assert command[2] == expected_model
-    assert command[3:] == ["--epoch", expected_epoch]
+    assert command[3:] == [
+        "--epoch",
+        expected_epoch,
+        "--",
+        "--tensor-parallel-size",
+        "1",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "expected_tensor_parallel"),
+    [
+        ([], "8"),
+        (["--vllm-tensor-parallel", "4"], "4"),
+    ],
+)
+def test_gpu_main_configures_vllm_tensor_parallelism(
+    tmp_path, extra_args, expected_tensor_parallel
+):
+    data_dir = tmp_path / "data"
+    fake_bin = tmp_path / "bin"
+    capture_path = tmp_path / "python-args.txt"
+    fake_bin.mkdir()
+    _write_fake_python(fake_bin)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["CAPTURE_PATH"] = str(capture_path)
+    env["FAKE_CUDA_DEVICE_COUNT"] = "8"
+    result = subprocess.run(
+        [
+            "bash",
+            str(GPU_MAIN),
+            "--epoch",
+            "1",
+            "--data-dir",
+            str(data_dir),
+            *extra_args,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 23
+    command = capture_path.read_text(encoding="utf-8").strip().split()
+    tensor_parallel_index = command.index("--tensor-parallel-size")
+    assert command[tensor_parallel_index + 1] == expected_tensor_parallel
+    assert f"vLLM will use tensor parallelism {expected_tensor_parallel}" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -198,6 +247,60 @@ def test_gpu_main_rejects_context_parallel_not_dividing_gpu_count(tmp_path):
 
     assert result.returncode == 2
     assert "Detected GPU count (8) must be divisible by --context-parallel (3)" in result.stderr
+    assert not capture_path.exists()
+
+
+@pytest.mark.parametrize("tensor_parallel", ["0", "not-an-integer"])
+def test_gpu_main_rejects_invalid_vllm_tensor_parallel(tmp_path, tensor_parallel):
+    result = subprocess.run(
+        [
+            "bash",
+            str(GPU_MAIN),
+            "--epoch",
+            "1",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--vllm-tensor-parallel",
+            tensor_parallel,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "--vllm-tensor-parallel must be a positive integer" in result.stderr
+
+
+def test_gpu_main_rejects_vllm_tensor_parallel_above_visible_gpu_count(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _write_fake_python(fake_bin)
+
+    capture_path = tmp_path / "python-args.txt"
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["CAPTURE_PATH"] = str(capture_path)
+    env["FAKE_CUDA_DEVICE_COUNT"] = "8"
+    result = subprocess.run(
+        [
+            "bash",
+            str(GPU_MAIN),
+            "--epoch",
+            "1",
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--vllm-tensor-parallel",
+            "9",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "cannot exceed the visible GPU count (8)" in result.stderr
     assert not capture_path.exists()
 
 

@@ -1,6 +1,6 @@
 ## Install NVIDIA Container Toolkit on a standalone virtual machine
 
-If you are running a standalone virtual machine with GPUs, you must install NVIDIA Container Toolkit first to make GPUs visible inside the container. Note GPUs are invisible by default if you don't install these dependencies.
+If you are running a standalone virtual machine with GPUs, you must install NVIDIA Container Toolkit first to make GPUs visible inside the container. Note GPUs are invisible inside docker container by default if you don't install these dependencies.
 
 ### Install Docker Engine if you haven't
 
@@ -35,6 +35,8 @@ sudo usermod -aG docker "$USER"
 newgrp docker
 ```
 
+### Now install NVIDIA Container Toolkit to make GPUs visible inside the container
+
 ```bash
 curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
   | sudo gpg --dearmor \
@@ -56,4 +58,4 @@ sudo systemctl restart docker
 docker run --rm --gpus all ubuntu:24.04 nvidia-smi
 ```
 
-You should see the GPUs.
+You should now see all the GPUs from inside the container.

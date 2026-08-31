@@ -6,17 +6,20 @@ START_EPOCH="0"
 DATA_DIR=""
 INITIAL_MODEL="Qwen/Qwen3.5-4B"
 CONTEXT_PARALLEL="1"
+VLLM_TENSOR_PARALLEL="auto"
 
 usage() {
   cat <<'USAGE'
 Usage:
-  bash main.sh --epoch N --data-dir PATH [--start_epoch N] [--context-parallel N]
+  bash main.sh --epoch N --data-dir PATH [--start_epoch N] [options]
 
 Options:
   --epoch N             Total target epoch count; the final epoch is N-1.
   --start_epoch N       First zero-based epoch to run. Default: 0.
   --data-dir PATH       Root directory for model/epoch_N HF models and checkpoints.
   --context-parallel N  Context-parallel GPU count for DAPO. Default: 1.
+  --vllm-tensor-parallel N
+                        Tensor-parallel GPU count for vLLM. Default: all visible GPUs.
   -h, --help            Show this help.
 USAGE
 }
@@ -37,6 +40,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --context-parallel)
       CONTEXT_PARALLEL="${2:?missing value for --context-parallel}"
+      shift 2
+      ;;
+    --vllm-tensor-parallel)
+      VLLM_TENSOR_PARALLEL="${2:?missing value for --vllm-tensor-parallel}"
       shift 2
       ;;
     -h|--help)
@@ -83,6 +90,12 @@ if ! [[ "$CONTEXT_PARALLEL" =~ ^[0-9]+$ ]] || [[ "$CONTEXT_PARALLEL" -lt 1 ]]; t
   exit 2
 fi
 
+if [[ "$VLLM_TENSOR_PARALLEL" != "auto" ]] &&
+  { ! [[ "$VLLM_TENSOR_PARALLEL" =~ ^[0-9]+$ ]] || [[ "$VLLM_TENSOR_PARALLEL" -lt 1 ]]; }; then
+  echo "--vllm-tensor-parallel must be a positive integer, got: $VLLM_TENSOR_PARALLEL" >&2
+  exit 2
+fi
+
 mkdir -p "$DATA_DIR/model" "$DATA_DIR/checkpoints"
 DATA_DIR="$(cd "$DATA_DIR" && pwd)"
 
@@ -105,11 +118,17 @@ detect_num_gpus() {
 }
 
 NUM_GPUS="$(detect_num_gpus)"
+if [[ "$VLLM_TENSOR_PARALLEL" == "auto" ]]; then
+  VLLM_TENSOR_PARALLEL="$NUM_GPUS"
+elif (( VLLM_TENSOR_PARALLEL > NUM_GPUS )); then
+  echo "--vllm-tensor-parallel ($VLLM_TENSOR_PARALLEL) cannot exceed the visible GPU count ($NUM_GPUS)" >&2
+  exit 2
+fi
 if (( NUM_GPUS % CONTEXT_PARALLEL != 0 )); then
   echo "Detected GPU count ($NUM_GPUS) must be divisible by --context-parallel ($CONTEXT_PARALLEL)" >&2
   exit 2
 fi
-echo "Detected $NUM_GPUS visible CUDA GPU(s); DAPO will use $NUM_GPUS process(es) with context parallelism $CONTEXT_PARALLEL."
+echo "Detected $NUM_GPUS visible CUDA GPU(s); vLLM will use tensor parallelism $VLLM_TENSOR_PARALLEL, and DAPO will use $NUM_GPUS process(es) with context parallelism $CONTEXT_PARALLEL."
 
 validate_hf_model() {
   local model_dir="$1"
@@ -161,7 +180,11 @@ for ((epoch = START_EPOCH; epoch < EPOCH; epoch++)); do
   fi
 
   echo "[epoch $epoch/$((EPOCH - 1))] Starting vLLM server with model: $MODEL_PATH"
-  python vllm/server.py --model "$MODEL_PATH" --epoch "$epoch"
+  python vllm/server.py \
+    --model "$MODEL_PATH" \
+    --epoch "$epoch" \
+    -- \
+    --tensor-parallel-size "$VLLM_TENSOR_PARALLEL"
 
   echo "[epoch $epoch/$((EPOCH - 1))] Starting DAPO: $MODEL_PATH -> $MODEL_SAVE_PATH"
   (
