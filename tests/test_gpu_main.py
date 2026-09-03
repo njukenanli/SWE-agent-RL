@@ -201,6 +201,110 @@ def test_gpu_main_serves_exported_hf_checkpoint_in_next_epoch(tmp_path):
     assert (data_dir / "model/epoch_0").is_symlink()
 
 
+def test_gpu_main_aborts_when_current_epoch_has_complete_model(tmp_path):
+    data_dir = tmp_path / "data"
+    checkpoint_path = data_dir / "checkpoints/epoch_0"
+    model_path = data_dir / "model/epoch_0"
+    _write_hf_model(checkpoint_path / "global_step_1/model/huggingface")
+    model_path.parent.mkdir(parents=True)
+    model_path.symlink_to("../checkpoints/epoch_0/global_step_1/model/huggingface")
+
+    fake_bin = tmp_path / "bin"
+    capture_path = tmp_path / "python-args.txt"
+    fake_bin.mkdir()
+    _write_fake_python(fake_bin)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["CAPTURE_PATH"] = str(capture_path)
+    result = subprocess.run(
+        [
+            "bash",
+            str(GPU_MAIN),
+            "--epoch",
+            "1",
+            "--data-dir",
+            str(data_dir),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert (
+        f"Model path already exists: {model_path}. If you want to skip this epoch, "
+        f"check the model checkpoint under {model_path} is complete and then increase "
+        "start_epoch arg; if you want to redo this epoch, manually delete model "
+        f"checkpoints at {model_path} and all checkpoints of epochs after it."
+    ) in result.stderr
+    assert checkpoint_path.is_dir()
+    assert model_path.is_symlink()
+    assert model_path.is_dir()
+    assert not capture_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("create_checkpoint", "model_state"),
+    [
+        (True, "missing"),
+        (False, "complete"),
+        (True, "incomplete"),
+        (True, "broken_symlink"),
+    ],
+)
+def test_gpu_main_removes_incomplete_current_epoch_and_retries(
+    tmp_path, create_checkpoint, model_state
+):
+    data_dir = tmp_path / "data"
+    checkpoint_path = data_dir / "checkpoints/epoch_0"
+    model_path = data_dir / "model/epoch_0"
+
+    if create_checkpoint:
+        checkpoint_path.mkdir(parents=True)
+        (checkpoint_path / "partial").write_text("partial\n", encoding="utf-8")
+    if model_state == "complete":
+        _write_hf_model(model_path)
+    elif model_state == "incomplete":
+        model_path.mkdir(parents=True)
+        (model_path / "partial").write_text("partial\n", encoding="utf-8")
+    elif model_state == "broken_symlink":
+        model_path.parent.mkdir(parents=True)
+        model_path.symlink_to("missing-hf-export")
+
+    fake_bin = tmp_path / "bin"
+    capture_path = tmp_path / "python-args.txt"
+    fake_bin.mkdir()
+    _write_fake_python(fake_bin)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["CAPTURE_PATH"] = str(capture_path)
+    result = subprocess.run(
+        [
+            "bash",
+            str(GPU_MAIN),
+            "--epoch",
+            "1",
+            "--data-dir",
+            str(data_dir),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 23
+    assert not checkpoint_path.exists()
+    assert not checkpoint_path.is_symlink()
+    assert not model_path.exists()
+    assert not model_path.is_symlink()
+    command = capture_path.read_text(encoding="utf-8").strip().split()
+    assert command[:3] == ["vllm/server.py", "--model", "Qwen/Qwen3.5-4B"]
+
+
 @pytest.mark.parametrize(
     ("gpu_count", "extra_args", "expected_context_parallel"),
     [

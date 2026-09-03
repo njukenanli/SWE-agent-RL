@@ -170,13 +170,20 @@ for ((epoch = START_EPOCH; epoch < EPOCH; epoch++)); do
   HF_EXPORT_PATH="$CHECKPOINT_PATH/global_step_1/model/huggingface"
   MODEL_SAVE_PATH="$DATA_DIR/model/epoch_$epoch"
 
-  if [[ -e "$CHECKPOINT_PATH" || -L "$CHECKPOINT_PATH" ]]; then
-    echo "Checkpoint path already exists: $CHECKPOINT_PATH" >&2
+  if [[ -e "$CHECKPOINT_PATH" || -L "$CHECKPOINT_PATH" ]] &&
+    [[ -e "$MODEL_SAVE_PATH" || -L "$MODEL_SAVE_PATH" ]] &&
+    validate_hf_model "$MODEL_SAVE_PATH"; then
+    echo "Model path already exists: $MODEL_SAVE_PATH. If you want to skip this epoch, check the model checkpoint under $MODEL_SAVE_PATH is complete and then increase --start_epoch argument; if you want to redo this epoch, manually delete model checkpoints at $CHECKPOINT_PATH and $MODEL_SAVE_PATH and all checkpoints of epochs after it." >&2
     exit 1
   fi
+
+  if [[ -e "$CHECKPOINT_PATH" || -L "$CHECKPOINT_PATH" ]]; then
+    echo "Removing incomplete checkpoint path: $CHECKPOINT_PATH" >&2
+    rm -rf -- "$CHECKPOINT_PATH"
+  fi
   if [[ -e "$MODEL_SAVE_PATH" || -L "$MODEL_SAVE_PATH" ]]; then
-    echo "Model path already exists: $MODEL_SAVE_PATH" >&2
-    exit 1
+    echo "Removing incomplete model path: $MODEL_SAVE_PATH" >&2
+    rm -rf -- "$MODEL_SAVE_PATH"
   fi
 
   echo "[epoch $epoch/$((EPOCH - 1))] Starting vLLM server with model: $MODEL_PATH"

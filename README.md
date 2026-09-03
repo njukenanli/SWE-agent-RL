@@ -127,28 +127,27 @@ PY
 cd /workspace/gpu
 ```
 
-If the image is missing the Megatron dependency stack, install it before the
-editable VERL install:
-
-```bash
-cd /workspace/gpu/verl
-USE_SGLANG=0 USE_MEGATRON=1 bash scripts/install_vllm_sglang_mcore.sh
-pip install --no-deps -e .
-cd /workspace/gpu
-```
-
 ## Run
 
 ### Link the two machines through ssh tunnel
+
+If you are using a GPU machine that can run docker service inside, say, a virtual machine, 
+you can also run the CPU side code in your GPU machine. In this case two sides run in the 
+same machine, so the ssh tunnel is not needed.
+
+However, if you are using a containerized pod as your GPU machine, as it cannot run docker 
+container inside, you have to use a different CPU machine that can run docker service. 
+In this case you need to use the below ssh tunnel script to link the GPU machine and the CPU
+machine before running the source code.
 
 As specified in gpu/.env and cpu/.env:
 The CPU ACK server listens on port `8003`, and the GPU ACK server listens on port
 `8004`. Port `5001` forwards vLLM API. Port `9001` forwards trajectory uploads from the CPU
 machine to the GPU machine.
 
-The ssh tunnel configurations are set in `cpu/tunnel.sh`. Modify `cpu/tunnel.sh` to adapt to your GPU machine ssh login configurations.
+The ssh tunnel configurations are set in `cpu/tunnel.sh`. Modify `cpu/tunnel.sh` 
+to adapt to your GPU machine ssh login configurations.
 If the SSH connection is interrupted, the script retries indefinitely after a 10-second delay.
-Set `SSH_TUNNEL_RETRY_DELAY_SECONDS` to use a different delay.
 
 To start the ssh tunnel connection, from CPU machine, start a tmux session.
 Inside the session, run:
@@ -181,20 +180,12 @@ python main.py \
 The sweagent side waits until GPU side is ready (receives ACK from GPU side) and start rollout.
 
 `--workers` usually one 80GB GPU accpets 4 agent workers.
-`--batch_size` is the number of training task instances rolled out in each
-epoch. The selection advances through `--train_set` by epoch and wraps at the end.
-The selected instances overwrite `cpu/sweagent/temp.jsonl`, which is used only
-for training rollouts. Test rollouts use the complete `--test_set` in every epoch.
-GPU training consumes every task group in the uploaded `dapo.json`, so the
-number of DAPO groups automatically matches the epoch's training batch size.
-The GPU also derives the trajectories-per-group value from the uploaded JSON,
-so it follows the CPU training configuration without a fixed sample count.
-If an expected CPU sample directory or trajectory file is missing, the CPU
-inserts `[]`; the GPU treats it as reward 0 with no trainable tokens.
-DAPO uploads use up to five attempts, waiting 15 seconds between retryable
-transport or temporary HTTP failures.
+
+`--batch_size` is the number of training task instances rolled out in each epoch. 
 Keep the training batch smaller than the full dataset so each epoch performs
-one RL mini_batch=full_batch=one weight-update step -- this is necessary for agentic RL.
+one RL mini_batch=full_batch=one weight-update step. 
+This is necessary for agentic RL because RL performance degrades dramatically 
+if weight update steps > 1 for each epoch.
 
 ## On GPU side
 
@@ -211,7 +202,8 @@ bash main.sh \
   --context-parallel 2
 ```
 
-The code starts vllm, until CPU side sends ACK -- rollout ends and the cpu side uploads trajs to the gpu side. Then it starts verl training. When training ends the vllm is started again from the updated LM weights.
+The code starts vllm, until CPU side sends ACK -- rollout ends and the cpu side uploads trajs to the gpu side. 
+Then it starts verl training. When training ends the vllm is started again from the updated LM weights.
 
 `--start_epoch` defaults to `0` on both machines. Set it to the same non-zero
 value on the CPU and GPU to resume an interrupted run. For example,
@@ -222,6 +214,7 @@ the same `--data-dir`. The CPU uses epoch 37 for its dataset selection, output
 directories, trajectory upload, and ACK handshake.
 
 `--context-parallel` controls how many GPUs share each long agent trajectory and
-defaults to `1`. On an 8-GPU H100 machine, `--context-parallel 2` produces four
-data-parallel groups and splits each trajectory across two GPUs. If CUDA OOM, try
-to increase this value.
+defaults to `1`. On an 8-GPU H100 machine, set `--context-parallel 4`,
+which produces 2 data-parallel groups and splits each trajectory across 4 GPUs. 
+If CUDA OOM, try to increase this value from 1 to 2, then to 4 and finally to 8.
+For B300 which has large enough memory, simply use `--context-parallel 1`.
