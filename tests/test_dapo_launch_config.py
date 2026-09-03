@@ -59,3 +59,6 @@ def test_qwen35_dapo_uses_bshd_without_dynamic_batching(tmp_path):
     assert "data.use_dynamic_bsz=False" in command
     assert "engine.vanilla_mbridge=True" in command
     assert "engine.vanilla_mbridge=False" not in command
+    assert "engine.use_distributed_optimizer=True" in command
+    assert "engine.use_megatron_fsdp=False" in command
+    assert "engine.use_megatron_fsdp=True" not in command

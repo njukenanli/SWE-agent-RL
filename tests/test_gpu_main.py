@@ -132,6 +132,75 @@ def test_gpu_main_configures_vllm_tensor_parallelism(
     assert f"vLLM will use tensor parallelism {expected_tensor_parallel}" in result.stdout
 
 
+def test_gpu_main_serves_exported_hf_checkpoint_in_next_epoch(tmp_path):
+    data_dir = tmp_path / "data"
+    fake_bin = tmp_path / "bin"
+    capture_path = tmp_path / "vllm-args.txt"
+    fake_bin.mkdir()
+    python = fake_bin / "python"
+    python.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [[ \"$1\" == \"-c\" ]]; then\n"
+        "  printf '1\\n'\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [[ \"$1\" == \"vllm/server.py\" ]]; then\n"
+        "  printf '%s\\n' \"$*\" >> \"$CAPTURE_PATH\"\n"
+        "  if [[ $(wc -l < \"$CAPTURE_PATH\") -ge 2 ]]; then\n"
+        "    exit 23\n"
+        "  fi\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [[ \"$1\" == \"examples/sft/rft/dapo.py\" ]]; then\n"
+        "  shift\n"
+        "  while [[ $# -gt 0 ]]; do\n"
+        "    if [[ \"$1\" == \"--save-path\" ]]; then\n"
+        "      save_path=\"$2\"\n"
+        "      break\n"
+        "    fi\n"
+        "    shift\n"
+        "  done\n"
+        "  hf_path=\"$save_path/global_step_1/model/huggingface\"\n"
+        "  mkdir -p \"$hf_path\"\n"
+        "  printf '{}\\n' > \"$hf_path/config.json\"\n"
+        "  printf '{}\\n' > \"$hf_path/tokenizer_config.json\"\n"
+        "  printf 'weights' > \"$hf_path/model.safetensors\"\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 99\n",
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
+
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["CAPTURE_PATH"] = str(capture_path)
+    result = subprocess.run(
+        [
+            "bash",
+            str(GPU_MAIN),
+            "--epoch",
+            "2",
+            "--data-dir",
+            str(data_dir),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 23
+    commands = [line.split() for line in capture_path.read_text(encoding="utf-8").splitlines()]
+    assert commands[0][0:3] == ["vllm/server.py", "--model", "Qwen/Qwen3.5-4B"]
+    assert commands[1][0:2] == ["vllm/server.py", "--model"]
+    assert Path(commands[1][2]).resolve() == (
+        data_dir / "checkpoints/epoch_0/global_step_1/model/huggingface"
+    ).resolve()
+    assert commands[1][3:5] == ["--epoch", "1"]
+    assert (data_dir / "model/epoch_0").is_symlink()
+
+
 @pytest.mark.parametrize(
     ("gpu_count", "extra_args", "expected_context_parallel"),
     [
