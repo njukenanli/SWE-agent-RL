@@ -171,8 +171,8 @@ cd cpu
 
 python main.py \
   --num_workers 4 \
-  --train_set sweagent/datasets/verified-431.jsonl \
-  --test_set sweagent/datasets/verified-50.jsonl \
+  --train_set sweagent/datasets/swe-verified-train-set-431.jsonl \
+  --test_set sweagent/datasets/swe-verified-test-set-50.jsonl \
   --batch_size 64 \
   --start_epoch 0
 ```
